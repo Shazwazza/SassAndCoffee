@@ -16,6 +16,7 @@ require 'set'
 require 'enumerator'
 require 'stringio'
 require 'rbconfig'
+#RG require 'thread'
 
 module Sass
   # The root directory of the Sass source tree.
@@ -399,6 +400,33 @@ module Sass
       #RG arr
     end
 
+    # Returns a sub-array of `minuend` containing only elements that are also in
+    # `subtrahend`. Ensures that the return value has the same order as
+    # `minuend`, even on Rubinius where that's not guaranteed by {Array#-}.
+    #
+    # @param minuend [Array]
+    # @param subtrahend [Array]
+    # @return [Array]
+    def array_minus(minuend, subtrahend)
+      return minuend - subtrahend unless rbx?
+      set = Set.new(minuend) - subtrahend
+      minuend.select {|e| set.include?(e)}
+    end
+
+    # Returns a string description of the character that caused an
+    # `Encoding::UndefinedConversionError`.
+    #
+    # @param [Encoding::UndefinedConversionError]
+    # @return [String]
+    def undefined_conversion_error_char(e)
+      # Rubinius (as of 2.0.0.rc1) pre-quotes the error character.
+      return e.error_char if rbx?
+      # JRuby (as of 1.7.2) doesn't have an error_char field on
+      # Encoding::UndefinedConversionError.
+      return e.error_char.dump unless jruby?
+      e.message[/^"[^"]+"/] #"
+    end
+
     # Asserts that `value` falls within `range` (inclusive), leaving
     # room for slight floating-point errors.
     #
@@ -605,6 +633,27 @@ module Sass
       RUBY_ENGINE == "ironruby"
     end
 
+    # Whether or not this is running on Rubinius.
+    #
+    # @return [Boolean]
+    def rbx?
+      RUBY_ENGINE == "rbx"
+    end
+
+    # Whether or not this is running on JRuby.
+    #
+    # @return [Boolean]
+    def jruby?
+      RUBY_PLATFORM =~ /java/
+    end
+
+    # Returns an array of ints representing the JRuby version number.
+    #
+    # @return [Array<Fixnum>]
+    def jruby_version
+      $jruby_version ||= ::JRUBY_VERSION.split(".").map {|s| s.to_i}
+    end
+
     # Like `Dir.glob`, but works with backslash-separated paths on Windows.
     #
     # @param path [String]
@@ -655,6 +704,11 @@ module Sass
       ruby1_8? && Sass::Util::RUBY_VERSION[2] < 7
     end
 
+    # Wehter or not this is running under JRuby 1.6 or lower.
+    def jruby1_6?
+      jruby? && jruby_version[0] == 1 && jruby_version[1] < 7
+    end
+
     # Whether or not this is running under MacRuby.
     #
     # @return [Boolean]
@@ -691,7 +745,7 @@ module Sass
           line.encode(encoding)
         rescue Encoding::UndefinedConversionError => e
           yield <<MSG.rstrip, i + 1
-Invalid #{encoding.name} character #{e.error_char.dump}
+Invalid #{encoding.name} character #{undefined_conversion_error_char(e)}
 MSG
         end
       end
@@ -964,6 +1018,29 @@ MSG
       end
     end
 
+    # This creates a temp file and yields it for writing. When the
+    # write is complete, the file is moved into the desired location.
+    # The atomicity of this operation is provided by the filesystem's
+    # rename operation.
+    #
+    # @param filename [String] The file to write to.
+    # @yieldparam tmpfile [Tempfile] The temp file that can be written to.
+    # @return The value returned by the block.
+    def atomic_create_and_write_file(filename)
+      require 'tempfile'
+      tmpfile = Tempfile.new(File.basename(filename), File.dirname(filename))
+      tmp_path = tmpfile.path
+      tmpfile.binmode if tmpfile.respond_to?(:binmode)
+      result = yield tmpfile
+      File.rename tmpfile.path, filename
+      result
+    ensure
+      # close and remove the tempfile if it still exists,
+      # presumably due to an error during write
+      tmpfile.close if tmpfile
+      tmpfile.unlink if tmpfile
+    end
+
     private
 
     # Calculates the memoization table for the Least Common Subsequence algorithm.
@@ -1004,21 +1081,42 @@ require 'strscan'
 if Sass::Util.ruby1_8?
   Sass::Util::MultibyteStringScanner = StringScanner
 else
+  if Sass::Util.rbx?
+    # Rubinius's StringScanner class implements some of its methods in terms of
+    # others, which causes us to double-count bytes in some cases if we do
+    # straightforward inheritance. To work around this, we use a delegate class.
+    require 'delegate'
+    class Sass::Util::MultibyteStringScanner < DelegateClass(StringScanner)
+      def initialize(str)
+        super(StringScanner.new(str))
+        @mb_pos = 0
+        @mb_matched_size = nil
+        @mb_last_pos = nil
+      end
+
+      def is_a?(klass)
+        __getobj__.is_a?(klass) || super
+      end
+    end
+  else
+    class Sass::Util::MultibyteStringScanner < StringScanner
+      def initialize(str)
+        super
+        @mb_pos = 0
+        @mb_matched_size = nil
+        @mb_last_pos = nil
+      end
+    end
+  end
+
   # A wrapper of the native StringScanner class that works correctly with
   # multibyte character encodings. The native class deals only in bytes, not
   # characters, for methods like [#pos] and [#matched_size]. This class deals
   # only in characters, instead.
-  class Sass::Util::MultibyteStringScanner < StringScanner
+  class Sass::Util::MultibyteStringScanner
     def self.new(str)
       return StringScanner.new(str) if str.ascii_only?
       super
-    end
-
-    def initialize(str)
-      super
-      @mb_pos = 0
-      @mb_matched_size = nil
-      @mb_last_pos = nil
     end
 
     alias_method :byte_pos, :pos
@@ -1180,7 +1278,7 @@ module Sass
       return @@version if defined?(@@version)
 
 	  #RG numbers = File.read(scope('VERSION')).strip.split('.').
-      numbers = '3.2.5'.strip.split('.').
+      numbers = '3.2.9'.strip.split('.').
         map {|n| n =~ /^[0-9]+$/ ? n.to_i : n}
       #RG name = File.read(scope('VERSION_NAME')).strip
       name = 'Media Mark'.strip
@@ -1418,7 +1516,7 @@ class Sass::Logger::Base
     Kernel::warn(message)
   end
 
-end 
+end
 
 module Sass
 
@@ -1493,6 +1591,7 @@ module Sass
         _store(key, Sass::VERSION, sha, Marshal.dump(root))
       rescue TypeError, LoadError => e
         Sass::Util.sass_warn "Warning. Error encountered while saving cache #{path_to(key)}: #{e}"
+        nil
       end
 
       # Retrieve a {Sass::Tree::RootNode}.
@@ -1505,6 +1604,7 @@ module Sass
         Marshal.load(contents) if contents
       rescue EOFError, TypeError, ArgumentError, LoadError => e
         Sass::Util.sass_warn "Warning. Error encountered while reading cache #{path_to(key)}: #{e}"
+        nil
       end
 
       # Return the key for the sass file.
@@ -1545,7 +1645,6 @@ module Sass
       # @see Base#\_retrieve
       def _retrieve(key, version, sha)
         return unless File.readable?(path_to(key))
-        contents = nil
         File.open(path_to(key), "rb") do |f|
           if f.readline("\n").strip == version && f.readline("\n").strip == sha
             return f.read
@@ -1565,7 +1664,7 @@ module Sass
         # return if File.exists?(File.dirname(compiled_filename)) && !File.writable?(File.dirname(compiled_filename))
         # return if File.exists?(compiled_filename) && !File.writable?(compiled_filename)
         FileUtils.mkdir_p(File.dirname(compiled_filename))
-        File.open(compiled_filename, "wb") do |f|
+        Sass::Util.atomic_create_and_write_file(compiled_filename) do |f|
           f.puts(version)
           f.puts(sha)
           f.write(contents)
@@ -1659,7 +1758,7 @@ module Sass
       def retrieve(key, sha)
         @caches.each_with_index do |c, i|
           next unless obj = c.retrieve(key, sha)
-          @caches[0...i].each {|c| c.store(key, sha, obj)}
+          @caches[0...i].each {|prev| prev.store(key, sha, obj)}
           return obj
         end
         nil
@@ -2002,7 +2101,7 @@ module Sass::Tree
     #
     # @return [{#to_s => #to_s}]
     def debug_info
-      {:filename => filename && ("file://" + URI.escape(File.expand_path(filename))),
+      {:filename => filename && ("file://" + URI.escape(filename)),
        :line => self.line}
     end
 
@@ -2094,13 +2193,13 @@ module Sass::Tree
     private
 
     def normalize_indentation(str)
-      pre = str.split("\n").inject(str[/^[ \t]*/].split("")) do |pre, line|
+      ind = str.split("\n").inject(str[/^[ \t]*/].split("")) do |pre, line|
         line[/^[ \t]*/].split("").zip(pre).inject([]) do |arr, (a, b)|
           break arr if a != b
           arr << a
         end
       end.join
-      str.gsub(/^#{pre}/, '')
+      str.gsub(/^#{ind}/, '')
     end
   end
 end
@@ -3050,11 +3149,13 @@ class Sass::Tree::Visitors::Perform < Sass::Tree::Visitors::Base
 
     begin
       unless keywords.empty?
-        unknown_args = keywords.keys - callable.args.map {|var| var.first.underscored_name}
+        unknown_args = Sass::Util.array_minus(keywords.keys,
+          callable.args.map {|var| var.first.underscored_name})
         if callable.splat && unknown_args.include?(callable.splat.underscored_name)
           raise Sass::SyntaxError.new("Argument $#{callable.splat.name} of #{downcase_desc} cannot be used as a named argument.")
         elsif unknown_args.any?
-          raise Sass::SyntaxError.new("#{desc} doesn't have #{unknown_args.length > 1 ? 'the following arguments:' : 'an argument named'} #{unknown_args.map{|name| "$#{name}"}.join ', '}.")
+          description = unknown_args.length > 1 ? 'the following arguments:' : 'an argument named'
+          raise Sass::SyntaxError.new("#{desc} doesn't have #{description} #{unknown_args.map {|name| "$#{name}"}.join ', '}.")
         end
       end
     rescue Sass::SyntaxError => keyword_exception
@@ -3178,9 +3279,9 @@ class Sass::Tree::Visitors::Perform < Sass::Tree::Visitors::Base
     res = node.expr.perform(@environment)
     res = res.value if res.is_a?(Sass::Script::String)
     if node.filename
-      $stderr.puts "#{node.filename}:#{node.line} DEBUG: #{res}"
+      Sass::Util.sass_warn "#{node.filename}:#{node.line} DEBUG: #{res}"
     else
-      $stderr.puts "Line #{node.line} DEBUG: #{res}"
+      Sass::Util.sass_warn "Line #{node.line} DEBUG: #{res}"
     end
     []
   end
@@ -3455,7 +3556,7 @@ class Sass::Tree::Visitors::Perform < Sass::Tree::Visitors::Base
       end
     end
 
-    return if mixins.empty?
+    return unless mixins.include?(node.name)
     raise Sass::SyntaxError.new("#{msg} #{node.name} includes itself") if mixins.size == 1
 
     msg << "\n" << Sass::Util.enum_cons(mixins.reverse + [node.name], 2).map do |m1, m2|
@@ -3512,6 +3613,8 @@ class Sass::Tree::Visitors::Cssize < Sass::Tree::Visitors::Base
     end
   end
 
+  MERGEABLE_DIRECTIVES = [Sass::Tree::MediaNode]
+
   # Runs a block of code with the current parent node
   # replaced with the given node.
   #
@@ -3519,11 +3622,18 @@ class Sass::Tree::Visitors::Cssize < Sass::Tree::Visitors::Base
   # @yield A block in which the parent is set to `parent`.
   # @return [Object] The return value of the block.
   def with_parent(parent)
-    @parent_directives.push parent if parent.is_a?(Sass::Tree::DirectiveNode)
+    if parent.is_a?(Sass::Tree::DirectiveNode)
+      if MERGEABLE_DIRECTIVES.any? {|klass| parent.is_a?(klass)}
+        old_parent_directive = @parent_directives.pop
+      end
+      @parent_directives.push parent
+    end
+
     old_parent, @parent = @parent, parent
     yield
   ensure
     @parent_directives.pop if parent.is_a?(Sass::Tree::DirectiveNode)
+    @parent_directives.push old_parent_directive if old_parent_directive
     @parent = old_parent
   end
 
@@ -3550,7 +3660,7 @@ class Sass::Tree::Visitors::Cssize < Sass::Tree::Visitors::Base
       end
       charset_and_index = Sass::Util.ruby1_8? &&
         node.children.each_with_index.find {|c, _| c.is_a?(Sass::Tree::CharsetNode)}
-      if charset_and_index
+      if charset_and_index && charset_and_index.respond_to?(:last)
         index = charset_and_index.last
         node.children = node.children[0..index] + imports + node.children[index+1..-1]
       else
@@ -3595,12 +3705,12 @@ class Sass::Tree::Visitors::Cssize < Sass::Tree::Visitors::Base
       end
 
       sel = sseq.members
-      parent.resolved_rules.members.each do |seq|
-        if !seq.members.last.is_a?(Sass::Selector::SimpleSequence)
-          raise Sass::SyntaxError.new("#{seq} can't extend: invalid selector")
+      parent.resolved_rules.members.each do |member|
+        if !member.members.last.is_a?(Sass::Selector::SimpleSequence)
+          raise Sass::SyntaxError.new("#{member} can't extend: invalid selector")
         end
 
-        @extends[sel] = Extend.new(seq, sel, node, @parent_directives.dup, :not_found)
+        @extends[sel] = Extend.new(member, sel, node, @parent_directives.dup, :not_found)
       end
     end
 
@@ -3857,7 +3967,6 @@ class Sass::Tree::Visitors::Convert < Sass::Tree::Visitors::Base
       end.gsub(/^/, spaces) + "\n"
       content
     end
-    content.sub!(%r{^\s*(/\*)}, '/*!') if node.type == :loud #'
     content
   end
 
@@ -3963,13 +4072,19 @@ class Sass::Tree::Visitors::Convert < Sass::Tree::Visitors::Base
   end
 
   def visit_mixin(node)
+    arg_to_sass = lambda do |arg|
+      sass = arg.to_sass(@options)
+      sass = "(#{sass})" if arg.is_a?(Sass::Script::List) && arg.separator == :comma
+      sass
+    end
+
     unless node.args.empty? && node.keywords.empty? && node.splat.nil?
-      args = node.args.map {|a| a.to_sass(@options)}.join(", ")
+      args = node.args.map(&arg_to_sass).join(", ")
       keywords = Sass::Util.hash_to_a(node.keywords).
-        map {|k, v| "$#{dasherize(k)}: #{v.to_sass(@options)}"}.join(', ')
+        map {|k, v| "$#{dasherize(k)}: #{arg_to_sass[v]}"}.join(', ')
       if node.splat
         splat = (args.empty? && keywords.empty?) ? "" : ", "
-        splat = "#{splat}#{node.splat.to_sass(@options)}..."
+        splat = "#{splat}#{arg_to_sass[node.splat]}..."
       end
       arglist = "(#{args}#{', ' unless args.empty? || keywords.empty?}#{keywords}#{splat})"
     end
@@ -4239,7 +4354,6 @@ class Sass::Tree::Visitors::ToCss < Sass::Tree::Visitors::Base
 
       to_return = ''
       old_spaces = '  ' * @tabs
-      spaces = '  ' * (@tabs + 1)
       if node.style != :compressed
         if node.options[:debug_info] && !@in_directive
           to_return << visit(debug_info_rule(node.debug_info, node.options)) << "\n"
@@ -4767,7 +4881,7 @@ module Sass
         sels_with_ix = Sass::Util.enum_with_index(sels)
         _, i =
           if self.is_a?(Pseudo) || self.is_a?(SelectorPseudoClass)
-            sels_with_ix.find {|sel, _| sel.is_a?(Pseudo) && (sels.last.final? || sels.last.type == :element)}
+            sels_with_ix.find {|sel, _| sel.is_a?(Pseudo) && (sels.last.type == :element)}
           else
             sels_with_ix.find {|sel, _| sel.is_a?(Pseudo) || sel.is_a?(SelectorPseudoClass)}
           end
@@ -5242,7 +5356,7 @@ module Sass
           # is a supersequence of the other, use that, otherwise give up.
           lcs = Sass::Util.lcs(ops1, ops2)
           return unless lcs == ops1 || lcs == ops2
-          res.unshift *(ops1.size > ops2.size ? ops1 : ops2).reverse
+          res.unshift(*(ops1.size > ops2.size ? ops1 : ops2).reverse)
           return res
         end
 
@@ -5424,26 +5538,32 @@ module Sass
       # @param seqses [Array<Array<Array<SimpleSequence or String>>>]
       # @return [Array<Array<Array<SimpleSequence or String>>>]
       def trim(seqses)
-        # Avoid truly horrific quadratic behavior. TOOD: I think there
+        # Avoid truly horrific quadratic behavior. TODO: I think there
         # may be a way to get perfect trimming without going quadratic.
         return seqses if seqses.size > 100
+
+        # Keep the results in a separate array so we can be sure we aren't
+        # comparing against an already-trimmed selector. This ensures that two
+        # identical selectors don't mutually trim one another.
+        result = seqses.dup
+
         # This is n^2 on the sequences, but only comparing between
         # separate sequences should limit the quadratic behavior.
-        seqses.map do |seqs1|
-          seqs1.reject do |seq1|
-            min_spec = 0
-            _sources(seq1).map {|seq| min_spec += seq.specificity}
-            seqses.any? do |seqs2|
+        seqses.each_with_index do |seqs1, i|
+          result[i] = seqs1.reject do |seq1|
+            max_spec = _sources(seq1).map {|seq| seq.specificity}.max || 0
+            result.any? do |seqs2|
               next if seqs1.equal?(seqs2)
               # Second Law of Extend: the specificity of a generated selector
               # should never be less than the specificity of the extending
               # selector.
               #
               # See https://github.com/nex3/sass/issues/324.
-              seqs2.any? {|seq2| _specificity(seq2) >= min_spec && _superselector?(seq2, seq1)}
+              seqs2.any? {|seq2| _specificity(seq2) >= max_spec && _superselector?(seq2, seq1)}
             end
           end
         end
+        result
       end
 
       def _hash
@@ -5525,11 +5645,16 @@ module Sass
         @base ||= (members.first if members.first.is_a?(Element) || members.first.is_a?(Universal))
       end
 
-      # Returns the non-base selectors in this sequence.
+      def pseudo_elements
+        @pseudo_elements ||= (members - [base]).
+          select {|sel| sel.is_a?(Pseudo) && sel.type == :element}
+      end
+
+      # Returns the non-base, non-pseudo-class selectors in this sequence.
       #
       # @return [Set<Simple>]
       def rest
-        @rest ||= Set.new(base ? members[1..-1] : members)
+        @rest ||= Set.new(members - [base] - pseudo_elements)
       end
 
       # Whether or not this compound selector is the subject of the parent
@@ -5589,7 +5714,7 @@ module Sass
           # If A {@extend B} and C {...},
           # seq is A, sels is B, and self is C
 
-          self_without_sel = self.members - sels
+          self_without_sel = Sass::Util.array_minus(self.members, sels)
           group.each {|e, _| e.result = :failed_to_unify unless e.result == :succeeded}
           next unless unified = seq.members.last.unify(self_without_sel, subject?)
           group.each {|e, _| e.result = :succeeded}
@@ -5617,9 +5742,9 @@ module Sass
       #   by the time extension and unification happen,
       #   this exception will only ever be raised as a result of programmer error
       def unify(sels, other_subject)
-        return unless sseq = members.inject(sels) do |sseq, sel|
-          return unless sseq
-          sel.unify(sseq)
+        return unless sseq = members.inject(sels) do |member, sel|
+          return unless member
+          sel.unify(member)
         end
         SimpleSequence.new(sseq, other_subject || subject?)
       end
@@ -5633,7 +5758,9 @@ module Sass
       # @param sseq [SimpleSequence]
       # @return [Boolean]
       def superselector?(sseq)
-        (base.nil? || base.eql?(sseq.base)) && rest.subset?(sseq.rest)
+        (base.nil? || base.eql?(sseq.base)) &&
+          pseudo_elements.eql?(sseq.pseudo_elements) &&
+          rest.subset?(sseq.rest)
       end
 
       # @see Simple#to_a
@@ -5659,7 +5786,7 @@ module Sass
       def with_more_sources(sources)
         sseq = dup
         sseq.members = members.dup
-        sseq.sources.merge sources
+        sseq.sources = self.sources | sources
         sseq
       end
 
@@ -5685,8 +5812,8 @@ WARNING
       end
 
       def _eql?(other)
-        other.base.eql?(self.base) && Sass::Util.set_eql?(other.rest, self.rest) &&
-          other.subject? == self.subject?
+        other.base.eql?(self.base) && other.pseudo_elements == pseudo_elements &&
+          Sass::Util.set_eql?(other.rest, self.rest) && other.subject? == self.subject?
       end
     end
   end
@@ -5808,7 +5935,7 @@ module Sass
 
       # @see AbstractSequence#specificity
       def specificity
-        0
+        SPECIFICITY_BASE
       end
     end
 
@@ -6034,19 +6161,19 @@ module Sass
     # A pseudoclass (e.g. `:visited`) or pseudoelement (e.g. `::first-line`) selector.
     # It can have arguments (e.g. `:nth-child(2n+1)`).
     class Pseudo < Simple
-      # The type of the selector.
-      # `:class` if this is a pseudoclass selector,
-      # `:element` if it's a pseudoelement.
-      #
-      # @return [Symbol]
-      attr_reader :type
-
-      # Some psuedo-class-syntax selectors (`:after` and `:before)
-      # are actually considered pseudo-elements
-      # and must be at the end of the selector to function properly.
+      # Some psuedo-class-syntax selectors are actually considered
+      # pseudo-elements and must be treated differently. This is a list of such
+      # selectors
       #
       # @return [Array<String>]
-      FINAL_SELECTORS = %w[after before]
+      ACTUALLY_ELEMENTS = %w[after before first-line first-letter]
+
+      # Like \{#type}, but returns the type of selector this looks like, rather
+      # than the type it is semantically. This only differs from type for
+      # selectors in \{ACTUALLY\_ELEMENTS}.
+      #
+      # @return [Symbol]
+      attr_reader :syntactic_type
 
       # The name of the selector.
       #
@@ -6068,18 +6195,22 @@ module Sass
       # @param arg [nil, Array<String, Sass::Script::Node>] The argument to the selector,
       #   or nil if no argument was given
       def initialize(type, name, arg)
-        @type = type
+        @syntactic_type = type
         @name = name
         @arg = arg
       end
 
-      def final?
-        type == :class && FINAL_SELECTORS.include?(name.first)
+      # The type of the selector. `:class` if this is a pseudoclass selector,
+      # `:element` if it's a pseudoelement.
+      #
+      # @return [Symbol]
+      def type
+        ACTUALLY_ELEMENTS.include?(name.first) ? :element : syntactic_type
       end
 
       # @see Selector#to_a
       def to_a
-        res = [@type == :class ? ":" : "::"] + @name
+        res = [syntactic_type == :class ? ":" : "::"] + @name
         (res << "(").concat(Sass::Util.strip_string_array(@arg)) << ")" if @arg
         res
       end
@@ -6093,7 +6224,6 @@ module Sass
           sel.is_a?(Pseudo) && sel.type == :element &&
             (sel.name != self.name || sel.arg != self.arg)
         end
-        return sels + [self] if final?
         super
       end
 
@@ -6396,7 +6526,7 @@ module Sass::Script
   # Methods in this module are accessible from the SassScript context.
   # For example, you can write
   #
-  #     $color = hsl(120deg, 100%, 50%)
+  #     $color: hsl(120deg, 100%, 50%)
   #
   # and it will call {Sass::Script::Functions#hsl}.
   #
@@ -6407,13 +6537,10 @@ module Sass::Script
   # ## RGB Functions
   #
   # \{#rgb rgb($red, $green, $blue)}
-  # : Converts an `rgb(red, green, blue)` triplet into a color.
+  # : Creates a {Color} from red, green, and blue values.
   #
   # \{#rgba rgba($red, $green, $blue, $alpha)}
-  # : Converts an `rgba(red, green, blue, alpha)` quadruplet into a color.
-  #
-  # \{#rgba rgba($color, $alpha)}
-  # : Adds an alpha layer to any color value.
+  # : Creates a {Color} from red, green, blue, and alpha values.
   #
   # \{#red red($color)}
   # : Gets the red component of a color.
@@ -6430,10 +6557,11 @@ module Sass::Script
   # ## HSL Functions
   #
   # \{#hsl hsl($hue, $saturation, $lightness)}
-  # : Converts an `hsl(hue, saturation, lightness)` triplet into a color.
+  # : Creates a {Color} from hue, saturation, and lightness values.
   #
   # \{#hsla hsla($hue, $saturation, $lightness, $alpha)}
-  # : Converts an `hsla(hue, saturation, lightness, alpha)` quadruplet into a color.
+  # : Creates a {Color} from hue, saturation, lightness, and alpha
+  #   values.
   #
   # \{#hue hue($color)}
   # : Gets the hue component of a color.
@@ -6474,7 +6602,7 @@ module Sass::Script
   # : Gets the alpha component (opacity) of a color.
   #
   # \{#rgba rgba($color, $alpha)}
-  # : Add or change an alpha layer for any color value.
+  # : Changes the alpha component for a color.
   #
   # \{#opacify opacify($color, $amount)} / \{#fade_in fade-in($color, $amount)}
   # : Makes a color more opaque.
@@ -6485,10 +6613,10 @@ module Sass::Script
   # ## Other Color Functions
   #
   # \{#adjust_color adjust-color($color, \[$red\], \[$green\], \[$blue\], \[$hue\], \[$saturation\], \[$lightness\], \[$alpha\])}
-  # : Increase or decrease any of the components of a color.
+  # : Increases or decreases one or more components of a color.
   #
   # \{#scale_color scale-color($color, \[$red\], \[$green\], \[$blue\], \[$saturation\], \[$lightness\], \[$alpha\])}
-  # : Fluidly scale one or more components of a color.
+  # : Fluidly scales one or more properties of a color.
   #
   # \{#change_color change-color($color, \[$red\], \[$green\], \[$blue\], \[$hue\], \[$saturation\], \[$lightness\], \[$alpha\])}
   # : Changes one or more properties of a color.
@@ -6499,7 +6627,7 @@ module Sass::Script
   # ## String Functions
   #
   # \{#unquote unquote($string)}
-  # : Removes the quotes from a string.
+  # : Removes quotes from a string.
   #
   # \{#quote quote($string)}
   # : Adds quotes to a string.
@@ -6513,19 +6641,19 @@ module Sass::Script
   # : Rounds a number to the nearest whole number.
   #
   # \{#ceil ceil($value)}
-  # : Rounds a number up to the nearest whole number.
+  # : Rounds a number up to the next whole number.
   #
   # \{#floor floor($value)}
-  # : Rounds a number down to the nearest whole number.
+  # : Rounds a number down to the previous whole number.
   #
   # \{#abs abs($value)}
   # : Returns the absolute value of a number.
   #
-  # \{#min min($x1, $x2, ...)\}
-  # : Finds the minimum of several values.
+  # \{#min min($numbers...)\}
+  # : Finds the minimum of several numbers.
   #
-  # \{#max max($x1, $x2, ...)\}
-  # : Finds the maximum of several values.
+  # \{#max max($numbers...)\}
+  # : Finds the maximum of several numbers.
   #
   # ## List Functions {#list-functions}
   #
@@ -6541,24 +6669,31 @@ module Sass::Script
   # \{#append append($list1, $val, \[$separator\])}
   # : Appends a single value onto the end of a list.
   #
+  # \{#zip zip($lists...)}
+  # : Combines several lists into a single multidimensional list.
+  #
+  # \{#index index($list, $value)}
+  # : Returns the position of a value within a list.
+  #
   # ## Introspection Functions
   #
   # \{#type_of type-of($value)}
   # : Returns the type of a value.
   #
   # \{#unit unit($number)}
-  # : Returns the units associated with a number.
+  # : Returns the unit(s) associated with a number.
   #
   # \{#unitless unitless($number)}
-  # : Returns whether a number has units or not.
+  # : Returns whether a number has units.
   #
   # \{#comparable comparable($number-1, $number-2)}
-  # : Returns whether two numbers can be added or compared.
+  # : Returns whether two numbers can be added, subtracted, or compared.
   #
   # ## Miscellaneous Functions
   #
   # \{#if if($condition, $if-true, $if-false)}
-  # : Returns one of two values, depending on whether or not a condition is true.
+  # : Returns one of two values, depending on whether or not `$condition` is
+  #   true.
   #
   # ## Adding Custom Functions
   #
@@ -6634,6 +6769,12 @@ module Sass::Script
     # but none of them but the first will be used
     # unless the user uses keyword arguments.
     #
+    # @example
+    #   declare :rgba, [:hex, :alpha]
+    #   declare :rgba, [:red, :green, :blue, :alpha]
+    #   declare :accepts_anything, [], :var_args => true, :var_kwargs => true
+    #   declare :some_func, [:foo, :bar, :baz], :var_kwargs => true
+    #
     # @param method_name [Symbol] The name of the method
     #   whose signature is being declared.
     # @param args [Array<Symbol>] The names of the arguments for the function signature.
@@ -6647,12 +6788,6 @@ module Sass::Script
     #   to {Sass::Script::Literal}s as the last argument.
     #   In addition, if this is true and `:var_args` is not,
     #   Sass will ensure that the last argument passed is a hash.
-    #
-    # @example
-    #   declare :rgba, [:hex, :alpha]
-    #   declare :rgba, [:red, :green, :blue, :alpha]
-    #   declare :accepts_anything, [], :var_args => true, :var_kwargs => true
-    #   declare :some_func, [:foo, :bar, :baz], :var_kwargs => true
     def self.declare(method_name, args, options = {})
       @signatures[method_name] ||= []
       @signatures[method_name] << Signature.new(
@@ -6725,11 +6860,11 @@ module Sass::Script
       #   assert_type value, :Number
       # @param value [Sass::Script::Literal] A SassScript value
       # @param type [Symbol] The name of the type the value is expected to be
-      # @param name [String, nil] The name of the argument.
+      # @param name [String, Symbol, nil] The name of the argument.
       def assert_type(value, type, name = nil)
         return if value.is_a?(Sass::Script.const_get(type))
         err = "#{value.inspect} is not a #{type.to_s.downcase}"
-        err = "$#{name}: " + err if name
+        err = "$#{name.to_s.gsub('_', '-')}: " + err if name
         raise ArgumentError.new(err)
       end
     end
@@ -6753,67 +6888,69 @@ module Sass::Script
 
     # Creates a {Color} object from red, green, and blue values.
     #
-    # @param red [Number]
-    #   A number between 0 and 255 inclusive,
-    #   or between 0% and 100% inclusive
-    # @param green [Number]
-    #   A number between 0 and 255 inclusive,
-    #   or between 0% and 100% inclusive
-    # @param blue [Number]
-    #   A number between 0 and 255 inclusive,
-    #   or between 0% and 100% inclusive
     # @see #rgba
+    # @overload rgb($red, $green, $blue)
+    # @param $red [Number] The amount of red in the color. Must be between 0 and
+    #   255 inclusive, or between `0%` and `100%` inclusive
+    # @param $green [Number] The amount of green in the color. Must be between 0
+    #   and 255 inclusive, or between `0%` and `100%` inclusive
+    # @param $blue [Number] The amount of blue in the color. Must be between 0
+    #   and 255 inclusive, or between `0%` and `100%` inclusive
     # @return [Color]
+    # @raise [ArgumentError] if any parameter is the wrong type or out of bounds
     def rgb(red, green, blue)
-      assert_type red, :Number
-      assert_type green, :Number
-      assert_type blue, :Number
+      assert_type red, :Number, :red
+      assert_type green, :Number, :green
+      assert_type blue, :Number, :blue
 
-      Color.new([red, green, blue].map do |c|
+      Color.new([[red, :red], [green, :green], [blue, :blue]].map do |(c, name)|
           v = c.value
           if c.numerator_units == ["%"] && c.denominator_units.empty?
-            v = Sass::Util.check_range("Color value", 0..100, c, '%')
+            v = Sass::Util.check_range("$#{name}: Color value", 0..100, c, '%')
             v * 255 / 100.0
           else
-            Sass::Util.check_range("Color value", 0..255, c)
+            Sass::Util.check_range("$#{name}: Color value", 0..255, c)
           end
         end)
     end
     declare :rgb, [:red, :green, :blue]
 
+    # Creates a {Color} from red, green, blue, and alpha values.
     # @see #rgb
-    # @overload rgba(red, green, blue, alpha)
-    #   Creates a {Color} object from red, green, and blue values,
-    #   as well as an alpha channel indicating opacity.
     #
-    #   @param red [Number]
-    #     A number between 0 and 255 inclusive
-    #   @param green [Number]
-    #     A number between 0 and 255 inclusive
-    #   @param blue [Number]
-    #     A number between 0 and 255 inclusive
-    #   @param alpha [Number]
-    #     A number between 0 and 1
+    # @overload rgba($red, $green, $blue, $alpha)
+    #   @param $red [Number] The amount of red in the color. Must be between 0
+    #     and 255 inclusive
+    #   @param $green [Number] The amount of green in the color. Must be between
+    #     0 and 255 inclusive
+    #   @param $blue [Number] The amount of blue in the color. Must be between 0
+    #     and 255 inclusive
+    #   @param $alpha [Number] The opacity of the color. Must be between 0 and 1
+    #     inclusive
     #   @return [Color]
+    #   @raise [ArgumentError] if any parameter is the wrong type or out of
+    #     bounds
     #
-    # @overload rgba(color, alpha)
-    #   Sets the opacity of a color.
+    # @overload rgba($color, $alpha)
+    #   Sets the opacity of an existing color.
     #
     #   @example
     #     rgba(#102030, 0.5) => rgba(16, 32, 48, 0.5)
     #     rgba(blue, 0.2)    => rgba(0, 0, 255, 0.2)
     #
-    #   @param color [Color]
-    #   @param alpha [Number]
-    #     A number between 0 and 1
+    #   @param $color [Color] The color whose opacity will be changed.
+    #   @param $alpha [Number] The new opacity of the color. Must be between 0
+    #     and 1 inclusive
     #   @return [Color]
+    #   @raise [ArgumentError] if `$alpha` is out of bounds or either parameter
+    #     is the wrong type
     def rgba(*args)
       case args.size
       when 2
         color, alpha = args
 
-        assert_type color, :Color
-        assert_type alpha, :Number
+        assert_type color, :Color, :color
+        assert_type alpha, :Number, :alpha
 
         Sass::Util.check_range('Alpha channel', 0..1, alpha)
         color.with(:alpha => alpha.value)
@@ -6827,43 +6964,50 @@ module Sass::Script
     declare :rgba, [:red, :green, :blue, :alpha]
     declare :rgba, [:color, :alpha]
 
-    # Creates a {Color} object from hue, saturation, and lightness.
-    # Uses the algorithm from the [CSS3 spec](http://www.w3.org/TR/css3-color/#hsl-color).
+    # Creates a {Color} from hue, saturation, and lightness values. Uses the
+    # algorithm from the [CSS3 spec][].
     #
-    # @param hue [Number] The hue of the color.
-    #   Should be between 0 and 360 degrees, inclusive
-    # @param saturation [Number] The saturation of the color.
-    #   Must be between `0%` and `100%`, inclusive
-    # @param lightness [Number] The lightness of the color.
-    #   Must be between `0%` and `100%`, inclusive
-    # @return [Color] The resulting color
+    # [CSS3 spec]: http://www.w3.org/TR/css3-color/#hsl-color
+    #
     # @see #hsla
-    # @raise [ArgumentError] if `saturation` or `lightness` are out of bounds
+    # @overload hsl($hue, $saturation, $lightness)
+    # @param $hue [Number] The hue of the color. Should be between 0 and 360
+    #   degrees, inclusive
+    # @param $saturation [Number] The saturation of the color. Must be between
+    #   `0%` and `100%`, inclusive
+    # @param $lightness [Number] The lightness of the color. Must be between
+    #   `0%` and `100%`, inclusive
+    # @return [Color]
+    # @raise [ArgumentError] if `$saturation` or `$lightness` are out of bounds
+    #   or any parameter is the wrong type
     def hsl(hue, saturation, lightness)
       hsla(hue, saturation, lightness, Number.new(1))
     end
     declare :hsl, [:hue, :saturation, :lightness]
 
-    # Creates a {Color} object from hue, saturation, and lightness,
-    # as well as an alpha channel indicating opacity.
-    # Uses the algorithm from the [CSS3 spec](http://www.w3.org/TR/css3-color/#hsl-color).
+    # Creates a {Color} from hue, saturation, lightness, and alpha
+    # values. Uses the algorithm from the [CSS3 spec][].
     #
-    # @param hue [Number] The hue of the color.
-    #   Should be between 0 and 360 degrees, inclusive
-    # @param saturation [Number] The saturation of the color.
-    #   Must be between `0%` and `100%`, inclusive
-    # @param lightness [Number] The lightness of the color.
-    #   Must be between `0%` and `100%`, inclusive
-    # @param alpha [Number] The opacity of the color.
-    #   Must be between 0 and 1, inclusive
-    # @return [Color] The resulting color
+    # [CSS3 spec]: http://www.w3.org/TR/css3-color/#hsl-color
+    #
     # @see #hsl
-    # @raise [ArgumentError] if `saturation`, `lightness`, or `alpha` are out of bounds
+    # @overload hsla($hue, $saturation, $lightness, $alpha)
+    # @param $hue [Number] The hue of the color. Should be between 0 and 360
+    #   degrees, inclusive
+    # @param $saturation [Number] The saturation of the color. Must be between
+    #   `0%` and `100%`, inclusive
+    # @param $lightness [Number] The lightness of the color. Must be between
+    #   `0%` and `100%`, inclusive
+    # @param $alpha [Number] The opacity of the color. Must be between 0 and 1,
+    #   inclusive
+    # @return [Color]
+    # @raise [ArgumentError] if `$saturation`, `$lightness`, or `$alpha` are out
+    #   of bounds or any parameter is the wrong type
     def hsla(hue, saturation, lightness, alpha)
-      assert_type hue, :Number
-      assert_type saturation, :Number
-      assert_type lightness, :Number
-      assert_type alpha, :Number
+      assert_type hue, :Number, :hue
+      assert_type saturation, :Number, :saturation
+      assert_type lightness, :Number, :lightness
+      assert_type alpha, :Number, :alpha
 
       Sass::Util.check_range('Alpha channel', 0..1, alpha)
 
@@ -6875,101 +7019,112 @@ module Sass::Script
     end
     declare :hsla, [:hue, :saturation, :lightness, :alpha]
 
-    # Returns the red component of a color.
+    # Gets the red component of a color. Calculated from HSL where necessary via
+    # [this algorithm][hsl-to-rgb].
     #
-    # @param color [Color]
-    # @return [Number]
-    # @raise [ArgumentError] If `color` isn't a color
+    # [hsl-to-rgb]: http://www.w3.org/TR/css3-color/#hsl-color
+    #
+    # @overload red($color)
+    # @param $color [Color]
+    # @return [Number] The red component, between 0 and 255 inclusive
+    # @raise [ArgumentError] if `$color` isn't a color
     def red(color)
-      assert_type color, :Color
+      assert_type color, :Color, :color
       Sass::Script::Number.new(color.red)
     end
     declare :red, [:color]
 
-    # Returns the green component of a color.
+    # Gets the green component of a color. Calculated from HSL where necessary
+    # via [this algorithm][hsl-to-rgb].
     #
-    # @param color [Color]
-    # @return [Number]
-    # @raise [ArgumentError] If `color` isn't a color
+    # [hsl-to-rgb]: http://www.w3.org/TR/css3-color/#hsl-color
+    #
+    # @overload green($color)
+    # @param $color [Color]
+    # @return [Number] The green component, between 0 and 255 inclusive
+    # @raise [ArgumentError] if `$color` isn't a color
     def green(color)
-      assert_type color, :Color
+      assert_type color, :Color, :color
       Sass::Script::Number.new(color.green)
     end
     declare :green, [:color]
 
-    # Returns the blue component of a color.
+    # Gets the blue component of a color. Calculated from HSL where necessary
+    # via [this algorithm][hsl-to-rgb].
     #
-    # @param color [Color]
-    # @return [Number]
-    # @raise [ArgumentError] If `color` isn't a color
+    # [hsl-to-rgb]: http://www.w3.org/TR/css3-color/#hsl-color
+    #
+    # @overload blue($color)
+    # @param $color [Color]
+    # @return [Number] The blue component, between 0 and 255 inclusive
+    # @raise [ArgumentError] if `$color` isn't a color
     def blue(color)
-      assert_type color, :Color
+      assert_type color, :Color, :color
       Sass::Script::Number.new(color.blue)
     end
     declare :blue, [:color]
 
-    # Returns the hue component of a color.
+    # Returns the hue component of a color. See [the CSS3 HSL
+    # specification][hsl]. Calculated from RGB where necessary via [this
+    # algorithm][rgb-to-hsl].
     #
-    # See [the CSS3 HSL specification](http://en.wikipedia.org/wiki/HSL_and_HSV#Conversion_from_RGB_to_HSL_or_HSV).
+    # [hsl]: http://en.wikipedia.org/wiki/HSL_and_HSV#Conversion_from_RGB_to_HSL_or_HSV
+    # [rgb-to-hsl]: http://en.wikipedia.org/wiki/HSL_and_HSV#Conversion_from_RGB_to_HSL_or_HSV
     #
-    # Calculated from RGB where necessary via [this algorithm](http://en.wikipedia.org/wiki/HSL_and_HSV#Conversion_from_RGB_to_HSL_or_HSV).
-    #
-    # @param color [Color]
-    # @return [Number] between 0deg and 360deg
-    # @see #adjust_hue
-    # @raise [ArgumentError] if `color` isn't a color
+    # @overload hue($color)
+    # @param $color [Color]
+    # @return [Number] The hue component, between 0deg and 360deg
+    # @raise [ArgumentError] if `$color` isn't a color
     def hue(color)
-      assert_type color, :Color
+      assert_type color, :Color, :color
       Sass::Script::Number.new(color.hue, ["deg"])
     end
     declare :hue, [:color]
 
-    # Returns the saturation component of a color.
+    # Returns the saturation component of a color. See [the CSS3 HSL
+    # specification][hsl]. Calculated from RGB where necessary via [this
+    # algorithm][rgb-to-hsl].
     #
-    # See [the CSS3 HSL specification](http://en.wikipedia.org/wiki/HSL_and_HSV#Conversion_from_RGB_to_HSL_or_HSV).
+    # [hsl]: http://en.wikipedia.org/wiki/HSL_and_HSV#Conversion_from_RGB_to_HSL_or_HSV
+    # [rgb-to-hsl]: http://en.wikipedia.org/wiki/HSL_and_HSV#Conversion_from_RGB_to_HSL_or_HSV
     #
-    # Calculated from RGB where necessary via [this algorithm](http://en.wikipedia.org/wiki/HSL_and_HSV#Conversion_from_RGB_to_HSL_or_HSV).
-    #
-    # @param color [Color]
-    # @return [Number] between 0% and 100%
-    # @see #saturate
-    # @see #desaturate
-    # @raise [ArgumentError] if `color` isn't a color
+    # @overload saturation($color)
+    # @param $color [Color]
+    # @return [Number] The saturation component, between 0% and 100%
+    # @raise [ArgumentError] if `$color` isn't a color
     def saturation(color)
-      assert_type color, :Color
+      assert_type color, :Color, :color
       Sass::Script::Number.new(color.saturation, ["%"])
     end
     declare :saturation, [:color]
 
-    # Returns the hue component of a color.
+    # Returns the lightness component of a color. See [the CSS3 HSL
+    # specification][hsl]. Calculated from RGB where necessary via [this
+    # algorithm][rgb-to-hsl].
     #
-    # See [the CSS3 HSL specification](http://en.wikipedia.org/wiki/HSL_and_HSV#Conversion_from_RGB_to_HSL_or_HSV).
+    # [hsl]: http://en.wikipedia.org/wiki/HSL_and_HSV#Conversion_from_RGB_to_HSL_or_HSV
+    # [rgb-to-hsl]: http://en.wikipedia.org/wiki/HSL_and_HSV#Conversion_from_RGB_to_HSL_or_HSV
     #
-    # Calculated from RGB where necessary via [this algorithm](http://en.wikipedia.org/wiki/HSL_and_HSV#Conversion_from_RGB_to_HSL_or_HSV).
-    #
-    # @param color [Color]
-    # @return [Number] between 0% and 100%
-    # @see #lighten
-    # @see #darken
-    # @raise [ArgumentError] if `color` isn't a color
+    # @overload lightness($color)
+    # @param $color [Color]
+    # @return [Number] The lightness component, between 0% and 100%
+    # @raise [ArgumentError] if `$color` isn't a color
     def lightness(color)
-      assert_type color, :Color
+      assert_type color, :Color, :color
       Sass::Script::Number.new(color.lightness, ["%"])
     end
     declare :lightness, [:color]
 
-    # Returns the alpha component (opacity) of a color.
-    # This is 1 unless otherwise specified.
+    # Returns the alpha component (opacity) of a color. This is 1 unless
+    # otherwise specified.
     #
-    # This function also supports the proprietary Microsoft
-    # `alpha(opacity=20)` syntax.
+    # This function also supports the proprietary Microsoft `alpha(opacity=20)`
+    # syntax as a special case.
     #
-    # @overload def alpha(color)
-    # @param color [Color]
-    # @return [Number]
-    # @see #opacify
-    # @see #transparentize
-    # @raise [ArgumentError] If `color` isn't a color
+    # @overload alpha($color)
+    # @param $color [Color]
+    # @return [Number] The alpha component, between 0 and 1
+    # @raise [ArgumentError] if `$color` isn't a color
     def alpha(*args)
       if args.all? do |a|
           a.is_a?(Sass::Script::String) && a.type == :identifier &&
@@ -6981,39 +7136,39 @@ module Sass::Script
 
       raise ArgumentError.new("wrong number of arguments (#{args.size} for 1)") if args.size != 1
 
-      assert_type args.first, :Color
+      assert_type args.first, :Color, :color
       Sass::Script::Number.new(args.first.alpha)
     end
     declare :alpha, [:color]
 
-    # Returns the alpha component (opacity) of a color.
-    # This is 1 unless otherwise specified.
+    # Returns the alpha component (opacity) of a color. This is 1 unless
+    # otherwise specified.
     #
-    # @param color [Color]
-    # @return [Number]
-    # @see #opacify
-    # @see #transparentize
-    # @raise [ArgumentError] If `color` isn't a color
+    # @overload opacity($color)
+    # @param $color [Color]
+    # @return [Number] The alpha component, between 0 and 1
+    # @raise [ArgumentError] if `$color` isn't a color
     def opacity(color)
       return Sass::Script::String.new("opacity(#{color})") if color.is_a?(Sass::Script::Number)
-      assert_type color, :Color
+      assert_type color, :Color, :color
       Sass::Script::Number.new(color.alpha)
     end
     declare :opacity, [:color]
 
-    # Makes a color more opaque.
-    # Takes a color and an amount between 0 and 1,
-    # and returns a color with the opacity increased by that value.
+    # Makes a color more opaque. Takes a color and a number between 0 and 1, and
+    # returns a color with the opacity increased by that amount.
     #
+    # @see #transparentize
     # @example
     #   opacify(rgba(0, 0, 0, 0.5), 0.1) => rgba(0, 0, 0, 0.6)
     #   opacify(rgba(0, 0, 17, 0.8), 0.2) => #001
-    # @param color [Color]
-    # @param amount [Number]
+    # @overload opacify($color, $amount)
+    # @param $color [Color]
+    # @param $amount [Number] The amount to increase the opacity by, between 0
+    #   and 1
     # @return [Color]
-    # @see #transparentize
-    # @raise [ArgumentError] If `color` isn't a color,
-    #   or `number` isn't a number between 0 and 1
+    # @raise [ArgumentError] if `$amount` is out of bounds, or either parameter
+    #   is the wrong type
     def opacify(color, amount)
       _adjust(color, amount, :alpha, 0..1, :+)
     end
@@ -7022,19 +7177,20 @@ module Sass::Script
     alias_method :fade_in, :opacify
     declare :fade_in, [:color, :amount]
 
-    # Makes a color more transparent.
-    # Takes a color and an amount between 0 and 1,
-    # and returns a color with the opacity decreased by that value.
+    # Makes a color more transparent. Takes a color and a number between 0 and
+    # 1, and returns a color with the opacity decreased by that amount.
     #
+    # @see #opacify
     # @example
     #   transparentize(rgba(0, 0, 0, 0.5), 0.1) => rgba(0, 0, 0, 0.4)
     #   transparentize(rgba(0, 0, 0, 0.8), 0.2) => rgba(0, 0, 0, 0.6)
-    # @param color [Color]
-    # @param amount [Number]
+    # @overload transparentize($color, $amount)
+    # @param $color [Color]
+    # @param $amount [Number] The amount to decrease the opacity by, between 0
+    #   and 1
     # @return [Color]
-    # @see #opacify
-    # @raise [ArgumentError] If `color` isn't a color,
-    #   or `number` isn't a number between 0 and 1
+    # @raise [ArgumentError] if `$amount` is out of bounds, or either parameter
+    #   is the wrong type
     def transparentize(color, amount)
       _adjust(color, amount, :alpha, 0..1, :-)
     end
@@ -7043,56 +7199,58 @@ module Sass::Script
     alias_method :fade_out, :transparentize
     declare :fade_out, [:color, :amount]
 
-    # Makes a color lighter.
-    # Takes a color and an amount between 0% and 100%,
-    # and returns a color with the lightness increased by that value.
+    # Makes a color lighter. Takes a color and a number between `0%` and `100%`,
+    # and returns a color with the lightness increased by that amount.
     #
+    # @see #darken
     # @example
     #   lighten(hsl(0, 0%, 0%), 30%) => hsl(0, 0, 30)
     #   lighten(#800, 20%) => #e00
-    # @param color [Color]
-    # @param amount [Number]
+    # @overload lighten($color, $amount)
+    # @param $color [Color]
+    # @param $amount [Number] The amount to increase the lightness by, between
+    #   `0%` and `100%`
     # @return [Color]
-    # @see #darken
-    # @raise [ArgumentError] If `color` isn't a color,
-    #   or `number` isn't a number between 0% and 100%
+    # @raise [ArgumentError] if `$amount` is out of bounds, or either parameter
+    #   is the wrong type
     def lighten(color, amount)
       _adjust(color, amount, :lightness, 0..100, :+, "%")
     end
     declare :lighten, [:color, :amount]
 
-    # Makes a color darker.
-    # Takes a color and an amount between 0% and 100%,
-    # and returns a color with the lightness decreased by that value.
+    # Makes a color darker. Takes a color and a number between 0% and 100%, and
+    # returns a color with the lightness decreased by that amount.
     #
+    # @see #lighten
     # @example
     #   darken(hsl(25, 100%, 80%), 30%) => hsl(25, 100%, 50%)
     #   darken(#800, 20%) => #200
-    # @param color [Color]
-    # @param amount [Number]
+    # @overload darken($color, $amount)
+    # @param $color [Color]
+    # @param $amount [Number] The amount to dencrease the lightness by, between
+    #   `0%` and `100%`
     # @return [Color]
-    # @see #lighten
-    # @raise [ArgumentError] If `color` isn't a color,
-    #   or `number` isn't a number between 0% and 100%
+    # @raise [ArgumentError] if `$amount` is out of bounds, or either parameter
+    #   is the wrong type
     def darken(color, amount)
       _adjust(color, amount, :lightness, 0..100, :-, "%")
     end
     declare :darken, [:color, :amount]
 
-    # Makes a color more saturated.
-    # Takes a color and an amount between 0% and 100%,
-    # and returns a color with the saturation increased by that value.
+    # Makes a color more saturated. Takes a color and a number between 0% and
+    # 100%, and returns a color with the saturation increased by that amount.
     #
+    # @see #desaturate
     # @example
     #   saturate(hsl(120, 30%, 90%), 20%) => hsl(120, 50%, 90%)
     #   saturate(#855, 20%) => #9e3f3f
-    # @overload saturate(color, amount)
-    #   @param color [Color]
-    #   @param amount [Number]
-    #   @return [Color]
-    #   @see #desaturate
-    #   @raise [ArgumentError] If `color` isn't a color,
-    #     or `number` isn't a number between 0% and 100%
+    # @overload saturate($color, $amount)
+    # @param $color [Color]
+    # @param $amount [Number] The amount to increase the saturation by, between
+    #   `0%` and `100%`
+    # @return [Color]
+    # @raise [ArgumentError] if `$amount` is out of bounds, or either parameter
+    #   is the wrong type
     def saturate(color, amount = nil)
       # Support the filter effects definition of saturate.
       # https://dvcs.w3.org/hg/FXTF/raw-file/tip/filters/index.html
@@ -7102,93 +7260,97 @@ module Sass::Script
     declare :saturate, [:color, :amount]
     declare :saturate, [:amount]
 
-    # Makes a color less saturated.
-    # Takes a color and an amount between 0% and 100%,
-    # and returns a color with the saturation decreased by that value.
+    # Makes a color less saturated. Takes a color and a number between 0% and
+    # 100%, and returns a color with the saturation decreased by that value.
     #
+    # @see #saturate
     # @example
     #   desaturate(hsl(120, 30%, 90%), 20%) => hsl(120, 10%, 90%)
     #   desaturate(#855, 20%) => #726b6b
-    # @param color [Color]
-    # @param amount [Number]
+    # @overload desaturate($color, $amount)
+    # @param $color [Color]
+    # @param $amount [Number] The amount to decrease the saturation by, between
+    #   `0%` and `100%`
     # @return [Color]
-    # @see #saturate
-    # @raise [ArgumentError] If `color` isn't a color,
-    #   or `number` isn't a number between 0% and 100%
+    # @raise [ArgumentError] if `$amount` is out of bounds, or either parameter
+    #   is the wrong type
     def desaturate(color, amount)
       _adjust(color, amount, :saturation, 0..100, :-, "%")
     end
     declare :desaturate, [:color, :amount]
 
-    # Changes the hue of a color while retaining the lightness and saturation.
-    # Takes a color and a number of degrees (usually between -360deg and 360deg),
-    # and returns a color with the hue rotated by that value.
+    # Changes the hue of a color. Takes a color and a number of degrees (usually
+    # between `-360deg` and `360deg`), and returns a color with the hue rotated
+    # along the color wheel by that amount.
     #
     # @example
     #   adjust-hue(hsl(120, 30%, 90%), 60deg) => hsl(180, 30%, 90%)
     #   adjust-hue(hsl(120, 30%, 90%), 060deg) => hsl(60, 30%, 90%)
     #   adjust-hue(#811, 45deg) => #886a11
-    # @param color [Color]
-    # @param amount [Number]
+    # @overload adjust_hue($color, $degrees)
+    # @param $color [Color]
+    # @param $degrees [Number] The number of degrees to rotate the hue
     # @return [Color]
-    # @raise [ArgumentError] If `color` isn't a color, or `number` isn't a number
+    # @raise [ArgumentError] if either parameter is the wrong type
     def adjust_hue(color, degrees)
-      assert_type color, :Color
-      assert_type degrees, :Number
+      assert_type color, :Color, :color
+      assert_type degrees, :Number, :degrees
       color.with(:hue => color.hue + degrees.value)
     end
     declare :adjust_hue, [:color, :degrees]
 
-    # Returns an IE hex string for a color with an alpha channel
-    # suitable for passing to IE filters.
+    # Converts a color into the format understood by IE filters.
     #
     # @example
     #   ie-hex-str(#abc) => #FFAABBCC
     #   ie-hex-str(#3322BB) => #FF3322BB
     #   ie-hex-str(rgba(0, 255, 0, 0.5)) => #8000FF00
-    # @param color [Color]
-    # @return [String]
-    # @raise [ArgumentError] If `color` isn't a color
+    # @overload ie_hex_str($color)
+    # @param $color [Color]
+    # @return [String] The IE-formatted string representation of the color
+    # @raise [ArgumentError] if `$color` isn't a color
     def ie_hex_str(color)
-      assert_type color, :Color
+      assert_type color, :Color, :color
       alpha = (color.alpha * 255).round.to_s(16).rjust(2, '0')
       Sass::Script::String.new("##{alpha}#{color.send(:hex_str)[1..-1]}".upcase)
     end
     declare :ie_hex_str, [:color]
 
-    # Adjusts one or more properties of a color.
-    # This can change the red, green, blue, hue, saturation, value, and alpha properties.
-    # The properties are specified as keyword arguments,
-    # and are added to or subtracted from the color's current value for that property.
+    # Increases or decreases one or more properties of a color. This can change
+    # the red, green, blue, hue, saturation, value, and alpha properties. The
+    # properties are specified as keyword arguments, and are added to or
+    # subtracted from the color's current value for that property.
     #
-    # `$red`, `$green`, and `$blue` properties should be between 0 and 255.
-    # `$saturation` and `$lightness` should be between 0% and 100%.
-    # `$alpha` should be between 0 and 1.
-    #
-    # All properties are optional.
-    # You can't specify both RGB properties (`$red`, `$green`, `$blue`)
-    # and HSL properties (`$hue`, `$saturation`, `$value`) at the same time.
+    # All properties are optional. You can't specify both RGB properties
+    # (`$red`, `$green`, `$blue`) and HSL properties (`$hue`, `$saturation`,
+    # `$value`) at the same time.
     #
     # @example
     #   adjust-color(#102030, $blue: 5) => #102035
     #   adjust-color(#102030, $red: -5, $blue: 5) => #0b2035
     #   adjust-color(hsl(25, 100%, 80%), $lightness: -30%, $alpha: -0.4) => hsla(25, 100%, 50%, 0.6)
-    # @param color [Color]
-    # @param red [Number]
-    # @param green [Number]
-    # @param blue [Number]
-    # @param hue [Number]
-    # @param saturation [Number]
-    # @param lightness [Number]
-    # @param alpha [Number]
+    # @overload adjust_color($color, [$red], [$green], [$blue], [$hue], [$saturation], [$lightness], [$alpha])
+    # @param $color [Color]
+    # @param $red [Number] The adjustment to make on the red component, between
+    #   -255 and 255 inclusive
+    # @param $green [Number] The adjustment to make on the green component,
+    #   between -255 and 255 inclusive
+    # @param $blue [Number] The adjustment to make on the blue component, between
+    #   -255 and 255 inclusive
+    # @param $hue [Number] The adjustment to make on the hue component, in
+    #   degrees
+    # @param $saturation [Number] The adjustment to make on the saturation
+    #   component, between `-100%` and `100%` inclusive
+    # @param $lightness [Number] The adjustment to make on the lightness
+    #   component, between `-100%` and `100%` inclusive
+    # @param $alpha [Number] The adjustment to make on the alpha component,
+    #   between -1 and 1 inclusive
     # @return [Color]
-    # @raise [ArgumentError] if `color` is not a color,
-    #   if any keyword argument is not a number,
-    #   if any keyword argument is not in the legal range,
-    #   if an unexpected keyword argument is given,
-    #   or if both HSL and RGB properties are given.
+    # @raise [ArgumentError] if any parameter is the wrong type or out-of
+    #   bounds, or if RGB properties and HSL properties are adjusted at the
+    #   same time
     def adjust_color(color, kwargs)
-      assert_type color, :Color
+      assert_type color, :Color, :color
       with = Sass::Util.map_hash({
           "red" => [-255..255, ""],
           "green" => [-255..255, ""],
@@ -7216,47 +7378,47 @@ module Sass::Script
     end
     declare :adjust_color, [:color], :var_kwargs => true
 
-    # Scales one or more properties of a color by a percentage value.
-    # Unlike \{#adjust_color adjust-color}, which changes a color's properties by fixed amounts,
-    # \{#scale_color scale-color} fluidly changes them based on how high or low they already are.
-    # That means that lightening an already-light color with \{#scale_color scale-color}
-    # won't change the lightness much,
-    # but lightening a dark color by the same amount will change it more dramatically.
-    # This has the benefit of making `scale-color($color, ...)` have a similar effect
-    # regardless of what `$color` is.
+    # Fluidly scales one or more properties of a color. Unlike
+    # \{#adjust_color adjust-color}, which changes a color's properties by fixed
+    # amounts, \{#scale_color scale-color} fluidly changes them based on how
+    # high or low they already are. That means that lightening an already-light
+    # color with \{#scale_color scale-color} won't change the lightness much,
+    # but lightening a dark color by the same amount will change it more
+    # dramatically. This has the benefit of making `scale-color($color, ...)`
+    # have a similar effect regardless of what `$color` is.
     #
-    # For example, the lightness of a color can be anywhere between 0 and 100.
-    # If `scale-color($color, $lightness: 40%)` is called, the resulting color's lightness
-    # will be 40% of the way between its original lightness and 100.
-    # If `scale-color($color, $lightness: -40%)` is called instead,
-    # the lightness will be 40% of the way between the original and 0.
+    # For example, the lightness of a color can be anywhere between `0%` and
+    # `100%`. If `scale-color($color, $lightness: 40%)` is called, the resulting
+    # color's lightness will be 40% of the way between its original lightness
+    # and 100. If `scale-color($color, $lightness: -40%)` is called instead, the
+    # lightness will be 40% of the way between the original and 0.
     #
-    # This can change the red, green, blue, saturation, value, and alpha properties.
-    # The properties are specified as keyword arguments.
-    # All arguments should be percentages between 0% and 100%.
+    # This can change the red, green, blue, saturation, value, and alpha
+    # properties. The properties are specified as keyword arguments. All
+    # arguments should be percentages between `0%` and `100%`.
     #
-    # All properties are optional.
-    # You can't specify both RGB properties (`$red`, `$green`, `$blue`)
-    # and HSL properties (`$saturation`, `$value`) at the same time.
+    # All properties are optional. You can't specify both RGB properties
+    # (`$red`, `$green`, `$blue`) and HSL properties (`$saturation`, `$value`)
+    # at the same time.
     #
     # @example
-    #   scale-color(hsl(120, 70, 80), $lightness: 50%) => hsl(120, 70, 90)
-    #   scale-color(rgb(200, 150, 170), $green: -40%, $blue: 70%) => rgb(200, 90, 229)
-    #   scale-color(hsl(200, 70, 80), $saturation: -90%, $alpha: -30%) => hsla(200, 7, 80, 0.7)
-    # @param color [Color]
-    # @param red [Number]
-    # @param green [Number]
-    # @param blue [Number]
-    # @param saturation [Number]
-    # @param lightness [Number]
-    # @param alpha [Number]
+    #   scale-color(hsl(120, 70%, 80%), $lightness: 50%) => hsl(120, 70%, 90%)
+    #   scale-color(rgb(200, 150%, 170%), $green: -40%, $blue: 70%) => rgb(200, 90, 229)
+    #   scale-color(hsl(200, 70%, 80%), $saturation: -90%, $alpha: -30%) => hsla(200, 7%, 80%, 0.7)
+    # @overload scale_color($color, [$red], [$green], [$blue], [$saturation], [$lightness], [$alpha])
+    # @param $color [Color]
+    # @param $red [Number]
+    # @param $green [Number]
+    # @param $blue [Number]
+    # @param $saturation [Number]
+    # @param $lightness [Number]
+    # @param $alpha [Number]
     # @return [Color]
-    # @raise [ArgumentError] if `color` is not a color,
-    #   if any keyword argument is not a percentage between 0% and 100%,
-    #   if an unexpected keyword argument is given,
-    #   or if both HSL and RGB properties are given.
+    # @raise [ArgumentError] if any parameter is the wrong type or out-of
+    #   bounds, or if RGB properties and HSL properties are adjusted at the
+    #   same time
     def scale_color(color, kwargs)
-      assert_type color, :Color
+      assert_type color, :Color, :color
       with = Sass::Util.map_hash({
           "red" => 255,
           "green" => 255,
@@ -7289,39 +7451,40 @@ module Sass::Script
     end
     declare :scale_color, [:color], :var_kwargs => true
 
-    # Changes one or more properties of a color.
-    # This can change the red, green, blue, hue, saturation, value, and alpha properties.
-    # The properties are specified as keyword arguments,
-    # and replace the color's current value for that property.
+    # Changes one or more properties of a color. This can change the red, green,
+    # blue, hue, saturation, value, and alpha properties. The properties are
+    # specified as keyword arguments, and replace the color's current value for
+    # that property.
     #
-    # `$red`, `$green`, and `$blue` properties should be between 0 and 255.
-    # `$saturation` and `$lightness` should be between 0% and 100%.
-    # `$alpha` should be between 0 and 1.
-    #
-    # All properties are optional.
-    # You can't specify both RGB properties (`$red`, `$green`, `$blue`)
-    # and HSL properties (`$hue`, `$saturation`, `$value`) at the same time.
+    # All properties are optional. You can't specify both RGB properties
+    # (`$red`, `$green`, `$blue`) and HSL properties (`$hue`, `$saturation`,
+    # `$value`) at the same time.
     #
     # @example
     #   change-color(#102030, $blue: 5) => #102005
     #   change-color(#102030, $red: 120, $blue: 5) => #782005
     #   change-color(hsl(25, 100%, 80%), $lightness: 40%, $alpha: 0.8) => hsla(25, 100%, 40%, 0.8)
-    # @param color [Color]
-    # @param red [Number]
-    # @param green [Number]
-    # @param blue [Number]
-    # @param hue [Number]
-    # @param saturation [Number]
-    # @param lightness [Number]
-    # @param alpha [Number]
+    # @overload change_color($color, [$red], [$green], [$blue], [$hue], [$saturation], [$lightness], [$alpha])
+    # @param $color [Color]
+    # @param $red [Number] The new red component for the color, within 0 and 255
+    #   inclusive
+    # @param $green [Number] The new green component for the color, within 0 and
+    #   255 inclusive
+    # @param $blue [Number] The new blue component for the color, within 0 and
+    #   255 inclusive
+    # @param $hue [Number] The new hue component for the color, in degrees
+    # @param $saturation [Number] The new saturation component for the color,
+    #   between `0%` and `100%` inclusive
+    # @param $lightness [Number] The new lightness component for the color,
+    #   within `0%` and `100%` inclusive
+    # @param $alpha [Number] The new alpha component for the color, within 0 and
+    #   1 inclusive
     # @return [Color]
-    # @raise [ArgumentError] if `color` is not a color,
-    #   if any keyword argument is not a number,
-    #   if any keyword argument is not in the legal range,
-    #   if an unexpected keyword argument is given,
-    #   or if both HSL and RGB properties are given.
+    # @raise [ArgumentError] if any parameter is the wrong type or out-of
+    #   bounds, or if RGB properties and HSL properties are adjusted at the
+    #   same time
     def change_color(color, kwargs)
-      assert_type color, :Color
+      assert_type color, :Color, :color
       with = Sass::Util.map_hash(%w[red green blue hue saturation lightness alpha]) do |name, max|
         next unless val = kwargs.delete(name)
         assert_type val, :Number, name
@@ -7337,33 +7500,32 @@ module Sass::Script
     end
     declare :change_color, [:color], :var_kwargs => true
 
-    # Mixes together two colors.
-    # Specifically, takes the average of each of the RGB components,
-    # optionally weighted by the given percentage.
-    # The opacity of the colors is also considered when weighting the components.
+    # Mixes two colors together. Specifically, takes the average of each of the
+    # RGB components, optionally weighted by the given percentage. The opacity
+    # of the colors is also considered when weighting the components.
     #
     # The weight specifies the amount of the first color that should be included
-    # in the returned color.
-    # The default, 50%, means that half the first color
-    # and half the second color should be used.
-    # 25% means that a quarter of the first color
-    # and three quarters of the second color should be used.
+    # in the returned color. The default, `50%`, means that half the first color
+    # and half the second color should be used. `25%` means that a quarter of
+    # the first color and three quarters of the second color should be used.
     #
     # @example
     #   mix(#f00, #00f) => #7f007f
     #   mix(#f00, #00f, 25%) => #3f00bf
     #   mix(rgba(255, 0, 0, 0.5), #00f) => rgba(63, 0, 191, 0.75)
-    # @overload mix(color1, color2, weight: 50%)
-    #   @param color1 [Color]
-    #   @param color2 [Color]
-    #   @param weight [Number] between 0% and 100%
-    #   @return [Color]
-    #   @raise [ArgumentError] if `color1` or `color2` aren't colors,
-    #     or `weight` isn't a number between 0% and 100%
-    def mix(color1, color2, weight = Number.new(50))
-      assert_type color1, :Color
-      assert_type color2, :Color
-      assert_type weight, :Number
+    # @overload mix($color-1, $color-2, $weight: 50%)
+    # @param $color-1 [Color]
+    # @param $color-2 [Color]
+    # @param $weight [Number] The relative weight of each color. Closer to `0%`
+    #   gives more weight to `$color`, closer to `100%` gives more weight to
+    #   `$color2`
+    # @return [Color]
+    # @raise [ArgumentError] if `$weight` is out of bounds or any parameter is
+    #   the wrong type
+    def mix(color_1, color_2, weight = Number.new(50))
+      assert_type color_1, :Color, :color_1
+      assert_type color_2, :Color, :color_2
+      assert_type weight, :Number, :weight
 
       Sass::Util.check_range("Weight", 0..100, weight, '%')
 
@@ -7372,11 +7534,11 @@ module Sass::Script
       # to perform the weighted average of the two RGB values.
       #
       # It works by first normalizing both parameters to be within [-1, 1],
-      # where 1 indicates "only use color1", -1 indicates "only use color2", and
+      # where 1 indicates "only use color_1", -1 indicates "only use color_2", and
       # all values in between indicated a proportionately weighted average.
       #
       # Once we have the normalized variables w and a, we apply the formula
-      # (w + a)/(1 + w*a) to get the combined weight (in [-1, 1]) of color1.
+      # (w + a)/(1 + w*a) to get the combined weight (in [-1, 1]) of color_1.
       # This formula has two especially nice properties:
       #
       #   * When either w or a are -1 or 1, the combined weight is also that number
@@ -7384,57 +7546,60 @@ module Sass::Script
       #
       #   * When a is 0, the combined weight is w, and vice versa.
       #
-      # Finally, the weight of color1 is renormalized to be within [0, 1]
-      # and the weight of color2 is given by 1 minus the weight of color1.
+      # Finally, the weight of color_1 is renormalized to be within [0, 1]
+      # and the weight of color_2 is given by 1 minus the weight of color_1.
       p = (weight.value/100.0).to_f
       w = p*2 - 1
-      a = color1.alpha - color2.alpha
+      a = color_1.alpha - color_2.alpha
 
       w1 = (((w * a == -1) ? w : (w + a)/(1 + w*a)) + 1)/2.0
       w2 = 1 - w1
 
-      rgb = color1.rgb.zip(color2.rgb).map {|v1, v2| v1*w1 + v2*w2}
-      alpha = color1.alpha*p + color2.alpha*(1-p)
+      rgb = color_1.rgb.zip(color_2.rgb).map {|v1, v2| v1*w1 + v2*w2}
+      alpha = color_1.alpha*p + color_2.alpha*(1-p)
       Color.new(rgb + [alpha])
     end
     declare :mix, [:color_1, :color_2]
     declare :mix, [:color_1, :color_2, :weight]
 
-    # Converts a color to grayscale.
-    # This is identical to `desaturate(color, 100%)`.
+    # Converts a color to grayscale. This is identical to `desaturate(color,
+    # 100%)`.
     #
-    # @param color [Color]
-    # @return [Color]
-    # @raise [ArgumentError] if `color` isn't a color
     # @see #desaturate
+    # @overload grayscale($color)
+    # @param $color [Color]
+    # @return [Color]
+    # @raise [ArgumentError] if `$color` isn't a color
     def grayscale(color)
       return Sass::Script::String.new("grayscale(#{color})") if color.is_a?(Sass::Script::Number)
       desaturate color, Number.new(100)
     end
     declare :grayscale, [:color]
 
-    # Returns the complement of a color.
-    # This is identical to `adjust-hue(color, 180deg)`.
+    # Returns the complement of a color. This is identical to `adjust-hue(color,
+    # 180deg)`.
     #
-    # @param color [Color]
-    # @return [Color]
-    # @raise [ArgumentError] if `color` isn't a color
     # @see #adjust_hue #adjust-hue
+    # @overload complement($color)
+    # @param $color [Color]
+    # @return [Color]
+    # @raise [ArgumentError] if `$color` isn't a color
     def complement(color)
       adjust_hue color, Number.new(180)
     end
     declare :complement, [:color]
 
-    # Returns the inverse (negative) of a color.
-    # The red, green, and blue values are inverted, while the opacity is left alone.
+    # Returns the inverse (negative) of a color. The red, green, and blue values
+    # are inverted, while the opacity is left alone.
     #
-    # @param color [Color]
+    # @overload invert($color)
+    # @param $color [Color]
     # @return [Color]
-    # @raise [ArgumentError] if `color` isn't a color
+    # @raise [ArgumentError] if `$color` isn't a color
     def invert(color)
       return Sass::Script::String.new("invert(#{color})") if color.is_a?(Sass::Script::Number)
 
-      assert_type color, :Color
+      assert_type color, :Color, :color
       color.with(
         :red => (255 - color.red),
         :green => (255 - color.green),
@@ -7442,16 +7607,17 @@ module Sass::Script
     end
     declare :invert, [:color]
 
-    # Removes quotes from a string if the string is quoted,
-    # or returns the same string if it's not.
+    # Removes quotes from a string. If the string is already unquoted, this will
+    # return it unmodified.
     #
-    # @param string [String]
-    # @return [String]
-    # @raise [ArgumentError] if `string` isn't a string
     # @see #quote
     # @example
     #   unquote("foo") => foo
     #   unquote(foo) => foo
+    # @overload unquote($string)
+    # @param $string [String]
+    # @return [String]
+    # @raise [ArgumentError] if `$string` isn't a string
     def unquote(string)
       if string.is_a?(Sass::Script::String)
         Sass::Script::String.new(string.value, :identifier)
@@ -7464,20 +7630,21 @@ module Sass::Script
     # Add quotes to a string if the string isn't quoted,
     # or returns the same string if it is.
     #
-    # @param string [String]
-    # @return [String]
-    # @raise [ArgumentError] if `string` isn't a string
     # @see #unquote
     # @example
     #   quote("foo") => "foo"
     #   quote(foo) => "foo"
+    # @overload quote($string)
+    # @param $string [String]
+    # @return [String]
+    # @raise [ArgumentError] if `$string` isn't a string
     def quote(string)
-      assert_type string, :String
+      assert_type string, :String, :string
       Sass::Script::String.new(string.value, :string)
     end
     declare :quote, [:string]
 
-    # Inspects the type of the argument, returning it as an unquoted string.
+    # Returns the type of a value.
     #
     # @example
     #   type-of(100px)  => number
@@ -7486,15 +7653,16 @@ module Sass::Script
     #   type-of(true)   => bool
     #   type-of(#fff)   => color
     #   type-of(blue)   => color
-    # @param value [Literal] The object to inspect
-    # @return [String] The unquoted string name of the literal's type
+    # @overload type_of($value)
+    # @param $value [Literal] The value to inspect
+    # @return [String] The unquoted string name of the value's type
     def type_of(value)
       Sass::Script::String.new(value.class.name.gsub(/Sass::Script::/,'').downcase)
     end
     declare :type_of, [:value]
 
-    # Inspects the unit of the number, returning it as a quoted string.
-    # Complex units are sorted in alphabetical order by numerator and denominator.
+    # Returns the unit(s) associated with a number. Complex units are sorted in
+    # alphabetical order by numerator and denominator.
     #
     # @example
     #   unit(100) => ""
@@ -7502,56 +7670,61 @@ module Sass::Script
     #   unit(3em) => "em"
     #   unit(10px * 5em) => "em*px"
     #   unit(10px * 5em / 30cm / 1rem) => "em*px/cm*rem"
-    # @param number [Literal] The number to inspect
-    # @return [String] The unit(s) of the number
-    # @raise [ArgumentError] if `number` isn't a number
+    # @overload unit($number)
+    # @param $number [Number]
+    # @return [String] The unit(s) of the number, as a quoted string
+    # @raise [ArgumentError] if `$number` isn't a number
     def unit(number)
-      assert_type number, :Number
+      assert_type number, :Number, :number
       Sass::Script::String.new(number.unit_str, :string)
     end
     declare :unit, [:number]
 
-    # Inspects the unit of the number, returning a boolean indicating if it is unitless.
+    # Returns whether a number has units.
     #
     # @example
     #   unitless(100) => true
     #   unitless(100px) => false
-    # @param number [Literal] The number to inspect
-    # @return [Bool] Whether or not the number is unitless
-    # @raise [ArgumentError] if `number` isn't a number
+    # @overload unitless($number)
+    # @param $number [Number]
+    # @return [Bool]
+    # @raise [ArgumentError] if `$number` isn't a number
     def unitless(number)
-      assert_type number, :Number
+      assert_type number, :Number, :number
       Sass::Script::Bool.new(number.unitless?)
     end
     declare :unitless, [:number]
 
-    # Returns true if two numbers are similar enough to be added, subtracted, or compared.
+    # Returns whether two numbers can added, subtracted, or compared.
     #
     # @example
     #   comparable(2px, 1px) => true
     #   comparable(100px, 3em) => false
     #   comparable(10cm, 3mm) => true
-    # @param number_1 [Number]
-    # @param number_2 [Number]
-    # @return [Bool] indicating if the numbers can be compared.
-    # @raise [ArgumentError] if `number_1` or `number_2` aren't numbers
+    # @overload comparable($number-1, $number-2)
+    # @param $number-1 [Number]
+    # @param $number-2 [Number]
+    # @return [Bool]
+    # @raise [ArgumentError] if either parameter is the wrong type
     def comparable(number_1, number_2)
-      assert_type number_1, :Number
-      assert_type number_2, :Number
+      assert_type number_1, :Number, :number_1
+      assert_type number_2, :Number, :number_2
       Sass::Script::Bool.new(number_1.comparable_to?(number_2))
     end
     declare :comparable, [:number_1, :number_2]
 
-    # Converts a decimal number to a percentage.
+    # Converts a unitless number to a percentage.
     #
     # @example
+    #   percentage(0.2) => 20%
     #   percentage(100px / 50px) => 200%
-    # @param value [Number] The decimal number to convert to a percentage
-    # @return [Number] The percentage
-    # @raise [ArgumentError] If `value` isn't a unitless number
+    # @overload percentage($value)
+    # @param $value [Number]
+    # @return [Number]
+    # @raise [ArgumentError] if `$value` isn't a unitless number
     def percentage(value)
       unless value.is_a?(Sass::Script::Number) && value.unitless?
-        raise ArgumentError.new("#{value.inspect} is not a unitless number")
+        raise ArgumentError.new("$value: #{value.inspect} is not a unitless number")
       end
       Sass::Script::Number.new(value.value * 100, ['%'])
     end
@@ -7562,76 +7735,83 @@ module Sass::Script
     # @example
     #   round(10.4px) => 10px
     #   round(10.6px) => 11px
-    # @param value [Number] The number
-    # @return [Number] The rounded number
-    # @raise [ArgumentError] if `value` isn't a number
+    # @overload round($value)
+    # @param $value [Number]
+    # @return [Number]
+    # @raise [ArgumentError] if `$value` isn't a number
     def round(value)
       numeric_transformation(value) {|n| n.round}
     end
     declare :round, [:value]
 
-    # Rounds a number up to the nearest whole number.
+    # Rounds a number up to the next whole number.
     #
     # @example
     #   ceil(10.4px) => 11px
     #   ceil(10.6px) => 11px
-    # @param value [Number] The number
-    # @return [Number] The rounded number
-    # @raise [ArgumentError] if `value` isn't a number
+    # @overload ceil($value)
+    # @param $value [Number]
+    # @return [Number]
+    # @raise [ArgumentError] if `$value` isn't a number
     def ceil(value)
       numeric_transformation(value) {|n| n.ceil}
     end
     declare :ceil, [:value]
 
-    # Rounds down to the nearest whole number.
+    # Rounds a number down to the previous whole number.
     #
     # @example
     #   floor(10.4px) => 10px
     #   floor(10.6px) => 10px
-    # @param value [Number] The number
-    # @return [Number] The rounded number
-    # @raise [ArgumentError] if `value` isn't a number
+    # @overload floor($value)
+    # @param $value [Number]
+    # @return [Number]
+    # @raise [ArgumentError] if `$value` isn't a number
     def floor(value)
       numeric_transformation(value) {|n| n.floor}
     end
     declare :floor, [:value]
 
-    # Finds the absolute value of a number.
+    # Returns the absolute value of a number.
     #
     # @example
     #   abs(10px) => 10px
     #   abs(-10px) => 10px
-    # @param value [Number] The number
-    # @return [Number] The absolute value
-    # @raise [ArgumentError] if `value` isn't a number
+    # @overload abs($value)
+    # @param $value [Number]
+    # @return [Number]
+    # @raise [ArgumentError] if `$value` isn't a number
     def abs(value)
       numeric_transformation(value) {|n| n.abs}
     end
     declare :abs, [:value]
 
-    # Finds the minimum of several values. This function takes any number of
+    # Finds the minimum of several numbers. This function takes any number of
     # arguments.
     #
     # @example
     #   min(1px, 4px) => 1px
     #   min(5em, 3em, 4em) => 3em
-    # @param values [[Number]] The numbers
-    # @return [Number] The minimum value
+    # @overload min($numbers...)
+    # @param $numbers [[Number]]
+    # @return [Number]
     # @raise [ArgumentError] if any argument isn't a number, or if not all of
     #   the arguments have comparable units
-    def min(*values)
-      values.each {|v| assert_type v, :Number}
-      values.inject {|min, val| min.lt(val).to_bool ? min : val}
+    def min(*numbers)
+      numbers.each {|n| assert_type n, :Number}
+      numbers.inject {|min, num| min.lt(num).to_bool ? min : num}
     end
     declare :min, [], :var_args => :true
 
-    # Finds the maximum of several values. This function takes any number of
+    # Finds the maximum of several numbers. This function takes any number of
     # arguments.
     #
     # @example
     #   max(1px, 4px) => 4px
     #   max(5em, 3em, 4em) => 5em
-    # @return [Number] The maximum value
+    # @overload max($numbers...)
+    # @param $numbers [[Number]]
+    # @return [Number]
     # @raise [ArgumentError] if any argument isn't a number, or if not all of
     #   the arguments have comparable units
     def max(*values)
@@ -7645,8 +7825,9 @@ module Sass::Script
     # @example
     #   length(10px) => 1
     #   length(10px 20px 30px) => 3
-    # @param list [Literal] The list
-    # @return [Number] The length
+    # @overload length($list)
+    # @param $list [Literal]
+    # @return [Number]
     def length(list)
       Sass::Script::Number.new(list.to_a.size)
     end
@@ -7654,18 +7835,20 @@ module Sass::Script
 
     # Gets the nth item in a list.
     #
-    # Note that unlike some languages, the first item in a Sass list is number 1,
-    # the second number 2, and so forth.
+    # Note that unlike some languages, the first item in a Sass list is number
+    # 1, the second number 2, and so forth.
     #
     # @example
     #   nth(10px 20px 30px, 1) => 10px
     #   nth((Helvetica, Arial, sans-serif), 3) => sans-serif
-    # @param list [Literal] The list
-    # @param n [Number] The index into the list
-    # @return [Literal] The nth item in the list
-    # @raise [ArgumentError] If `n` isn't an integer between 1 and the list's length.
+    # @overload nth($list, $n)
+    # @param $list [Literal]
+    # @param $n [Number] The index of the item to get
+    # @return [Literal]
+    # @raise [ArgumentError] if `$n` isn't an integer between 1 and the length
+    #   of `$list`
     def nth(list, n)
-      assert_type n, :Number
+      assert_type n, :Number, :n
       if !n.int?
         raise ArgumentError.new("List index #{n} must be an integer")
       elsif n.to_i < 1
@@ -7680,12 +7863,12 @@ module Sass::Script
     end
     declare :nth, [:list, :n]
 
-    # Joins together two lists into a new list.
+    # Joins together two lists into one.
     #
-    # Unless the `$separator` argument is passed,
-    # if one list is comma-separated and one is space-separated,
-    # the first parameter's separator is used for the resulting list.
-    # If the lists have only one item each, spaces are used for the resulting list.
+    # Unless `$separator` is passed, if one list is comma-separated and one is
+    # space-separated, the first parameter's separator is used for the resulting
+    # list. If both lists have fewer than two items, spaces are used for the
+    # resulting list.
     #
     # @example
     #   join(10px 20px, 30px 40px) => 10px 20px 30px 40px
@@ -7693,14 +7876,15 @@ module Sass::Script
     #   join(10px, 20px) => 10px 20px
     #   join(10px, 20px, comma) => 10px, 20px
     #   join((blue, red), (#abc, #def), space) => blue red #abc #def
-    # @overload join(list1, list2, separator: auto)
-    #   @param list1 [Literal] The first list to join
-    #   @param list2 [Literal] The second list to join
-    #   @param separator [String] How the list separator (comma or space) should be determined.
-    #     If this is `comma` or `space`, that is always the separator;
-    #     if this is `auto` (the default), the separator is determined as explained above.
+    # @overload join($list1, $list2, $separator: auto)
+    # @param $list1 [Literal]
+    # @param $list2 [Literal]
+    # @param $separator [String] The list separator to use. If this is `comma`
+    #   or `space`, that separator will be used. If this is `auto` (the
+    #   default), the separator is determined as explained above.
+    # @return [List]
     def join(list1, list2, separator = Sass::Script::String.new("auto"))
-      assert_type separator, :String
+      assert_type separator, :String, :separator
       unless %w[auto space comma].include?(separator.value)
         raise ArgumentError.new("Separator name must be space, comma, or auto")
       end
@@ -7719,8 +7903,7 @@ module Sass::Script
 
     # Appends a single value onto the end of a list.
     #
-    # Unless the `$separator` argument is passed,
-    # if the list has only one item,
+    # Unless the `$separator` argument is passed, if the list had only one item,
     # the resulting list will be space-separated.
     #
     # @example
@@ -7729,14 +7912,15 @@ module Sass::Script
     #   append(10px 20px, 30px 40px) => 10px 20px (30px 40px)
     #   append(10px, 20px, comma) => 10px, 20px
     #   append((blue, red), green, space) => blue red green
-    # @overload append(list, val, separator: auto)
-    #   @param list [Literal] The list to add the value to
-    #   @param val [Literal] The value to add to the end of the list
-    #   @param separator [String] How the list separator (comma or space) should be determined.
-    #     If this is `comma` or `space`, that is always the separator;
-    #     if this is `auto` (the default), the separator is the same as that used by the list.
+    # @overload append($list, $val, $separator: auto)
+    # @param $list [Literal]
+    # @param $val [Literal]
+    # @param $separator [String] The list separator to use. If this is `comma`
+    #   or `space`, that separator will be used. If this is `auto` (the
+    #   default), the separator is determined as explained above.
+    # @return [List]
     def append(list, val, separator = Sass::Script::String.new("auto"))
-      assert_type separator, :String
+      assert_type separator, :String, :separator
       unless %w[auto space comma].include?(separator.value)
         raise ArgumentError.new("Separator name must be space, comma, or auto")
       end
@@ -7752,8 +7936,9 @@ module Sass::Script
     declare :append, [:list, :val]
     declare :append, [:list, :val, :separator]
 
-    # Combines several lists into a single comma separated list
-    # space separated lists.
+    # Combines several lists into a single multidimensional list. The nth value
+    # of the resulting list is a space separated list of the source lists' nth
+    # values.
     #
     # The length of the resulting list is the length of the
     # shortest list.
@@ -7761,13 +7946,16 @@ module Sass::Script
     # @example
     #   zip(1px 1px 3px, solid dashed solid, red green blue)
     #   => 1px solid red, 1px dashed green, 3px solid blue
+    # @overload zip($lists...)
+    # @param $lists [[Literal]]
+    # @return [List]
     def zip(*lists)
       length = nil
       values = []
       lists.each do |list|
-        assert_type list, :List
-        values << list.value.dup
-        length = length.nil? ? list.value.length : [length, list.value.length].min
+        array = list.to_a
+        values << array.dup
+        length = length.nil? ? array.length : [length, array.length].min
       end
       values.each do |value|
         value.slice!(length)
@@ -7778,15 +7966,22 @@ module Sass::Script
     declare :zip, [], :var_args => true
 
 
-    # Returns the position of the given value within the given
-    # list. If not found, returns false.
+    # Returns the position of a value within a list. If the value isn't found,
+    # returns false instead.
+    #
+    # Note that unlike some languages, the first item in a Sass list is number
+    # 1, the second number 2, and so forth.
     #
     # @example
     #   index(1px solid red, solid) => 2
     #   index(1px solid red, dashed) => false
+    # @overload index($list, $value)
+    # @param $list [Literal]
+    # @param $value [Literal]
+    # @return [Number, Bool] The 1-based index of `$value` in `$list`, or
+    #   `false`
     def index(list, value)
-      assert_type list, :List
-      index = list.value.index {|e| e.eq(value).to_bool }
+      index = list.to_a.index {|e| e.eq(value).to_bool }
       if index
         Number.new(index + 1)
       else
@@ -7795,14 +7990,19 @@ module Sass::Script
     end
     declare :index, [:list, :value]
 
-    # Returns one of two values based on the truth value of the first argument.
+    # Returns one of two values, depending on whether or not `$condition` is
+    # true. Just like in `@if`, all values other than `false` and `null` are
+    # considered to be true.
     #
     # @example
     #   if(true, 1px, 2px) => 1px
     #   if(false, 1px, 2px) => 2px
-    # @param condition [Bool] Whether the first or second value will be returned.
-    # @param if_true [Literal] The value that will be returned if `$condition` is true.
-    # @param if_false [Literal] The value that will be returned if `$condition` is false.
+    # @overload if($condition, $if-true, $if-false)
+    # @param $condition [Literal] Whether the `$if-true` or `$if-false` will be
+    #   returned
+    # @param $if-true [Literal]
+    # @param $if-false [Literal]
+    # @return [Literal] `$if-true` or `$if-false`
     def if(condition, if_true, if_false)
       if condition.to_bool
         if_true
@@ -7812,19 +8012,49 @@ module Sass::Script
     end
     declare :if, [:condition, :if_true, :if_false]
 
+    # This function only exists as a workaround for IE7's [`content: counter`
+    # bug][bug]. It works identically to any other plain-CSS function, except it
+    # avoids adding spaces between the argument commas.
+    #
+    # [bug]: http://jes.st/2013/ie7s-css-breaking-content-counter-bug/
+    #
+    # @example
+    #   counter(item, ".") => counter(item,".")
+    # @overload counter($args...)
+    # @return [String]
+    def counter(*args)
+      Sass::Script::String.new("counter(#{args.map {|a| a.to_s(options)}.join(',')})")
+    end
+    declare :counter, [], :var_args => true
+
+    # This function only exists as a workaround for IE7's [`content: counters`
+    # bug][bug]. It works identically to any other plain-CSS function, except it
+    # avoids adding spaces between the argument commas.
+    #
+    # [bug]: http://jes.st/2013/ie7s-css-breaking-content-counter-bug/
+    #
+    # @example
+    #   counters(item, ".") => counters(item,".")
+    # @overload counters($args...)
+    # @return [String]
+    def counters(*args)
+      Sass::Script::String.new("counters(#{args.map {|a| a.to_s(options)}.join(',')})")
+    end
+    declare :counters, [], :var_args => true
+
     private
 
     # This method implements the pattern of transforming a numeric value into
     # another numeric value with the same units.
     # It yields a number to a block to perform the operation and return a number
     def numeric_transformation(value)
-      assert_type value, :Number
+      assert_type value, :Number, :value
       Sass::Script::Number.new(yield(value.value), value.numerator_units, value.denominator_units)
     end
 
     def _adjust(color, amount, attr, range, op, units = "")
-      assert_type color, :Color
-      assert_type amount, :Number
+      assert_type color, :Color, :color
+      assert_type amount, :Number, :amount
       Sass::Util.check_range('Amount', range, amount, units)
 
       # TODO: is it worth restricting here,
@@ -7890,12 +8120,18 @@ module Sass
 
       # @see Node#to_sass
       def to_sass(opts = {})
-        args = @args.map {|a| a.to_sass(opts)}.join(', ')
+        arg_to_sass = lambda do |arg|
+          sass = arg.to_sass(opts)
+          sass = "(#{sass})" if arg.is_a?(Sass::Script::List) && arg.separator == :comma
+          sass
+        end
+
+        args = @args.map(&arg_to_sass).join(', ')
         keywords = Sass::Util.hash_to_a(@keywords).
-          map {|k, v| "$#{dasherize(k, opts)}: #{v.to_sass(opts)}"}.join(', ')
+          map {|k, v| "$#{dasherize(k, opts)}: #{arg_to_sass[v]}"}.join(', ')
         if self.splat
           splat = (args.empty? && keywords.empty?) ? "" : ", "
-          splat = "#{splat}#{self.splat.inspect}..."
+          splat = "#{splat}#{arg_to_sass[self.splat]}..."
         end
         "#{dasherize(name, opts)}(#{args}#{', ' unless args.empty? || keywords.empty?}#{keywords}#{splat})"
       end
@@ -7942,18 +8178,53 @@ module Sass
           opts(Functions::EvaluationContext.new(environment.options).send(ruby_name, *args))
         end
       rescue ArgumentError => e
+        message = e.message
+
         # If this is a legitimate Ruby-raised argument error, re-raise it.
         # Otherwise, it's an error in the user's stylesheet, so wrap it.
-        if e.message =~ /^wrong number of arguments \(\d+ for \d+\)/ &&
-            e.backtrace[0] !~ /:in `(block in )?#{ruby_name}'$/ &&
-            # JRuby (as of 1.6.7.2) doesn't put the actual method for
-            # which the argument error was thrown in the backtrace, so
-            # we detect whether our send threw an argument error.
-            (RUBY_PLATFORM !~ /java/ || e.backtrace[0] !~ /:in `send'$/ ||
-             e.backtrace[1] !~ /:in `_perform'$/)
+        if Sass::Util.rbx?
+          # Rubinius has a different error report string than vanilla Ruby. It
+          # also doesn't put the actual method for which the argument error was
+          # thrown in the backtrace, nor does it include `send`, so we look for
+          # `_perform`.
+          if e.message =~ /^method '([^']+)': given (\d+), expected (\d+)/
+            error_name, given, expected = $1, $2, $3
+            raise e if error_name != ruby_name || e.backtrace[0] !~ /:in `_perform'$/
+            message = "wrong number of arguments (#{given} for #{expected})"
+          end
+        elsif Sass::Util.jruby?
+          if Sass::Util.jruby1_6?
+            should_maybe_raise = e.message =~ /^wrong number of arguments \((\d+) for (\d+)\)/ &&
+              # The one case where JRuby does include the Ruby name of the function
+              # is manually-thrown ArgumentErrors, which are indistinguishable from
+              # legitimate ArgumentErrors. We treat both of these as
+              # Sass::SyntaxErrors even though it can hide Ruby errors.
+              e.backtrace[0] !~ /:in `(block in )?#{ruby_name}'$/
+          else
+            should_maybe_raise = e.message =~ /^wrong number of arguments calling `[^`]+` \((\d+) for (\d+)\)/
+            given, expected = $1, $2
+          end
+
+          if should_maybe_raise
+            # JRuby 1.7 includes __send__ before send and _perform.
+            trace = e.backtrace.dup
+            raise e if !Sass::Util.jruby1_6? && trace.shift !~ /:in `__send__'$/
+
+            # JRuby (as of 1.7.2) doesn't put the actual method
+            # for which the argument error was thrown in the backtrace, so we
+            # detect whether our send threw an argument error.
+            if !(trace[0] =~ /:in `send'$/ && trace[1] =~ /:in `_perform'$/)
+              raise e
+            elsif !Sass::Util.jruby1_6?
+              # JRuby 1.7 doesn't use standard formatting for its ArgumentErrors.
+              message = "wrong number of arguments (#{given} for #{expected})"
+            end
+          end
+        elsif e.message =~ /^wrong number of arguments \(\d+ for \d+\)/ &&
+            e.backtrace[0] !~ /:in `(block in )?#{ruby_name}'$/
           raise e
         end
-        raise Sass::SyntaxError.new("#{e.message} for `#{name}'")
+        raise Sass::SyntaxError.new("#{message} for `#{name}'")
       end
 
       # This method is factored out from `_perform` so that compass can override
@@ -9134,7 +9405,10 @@ module Sass::Script
     def to_s(opts = {})
       ''
     end
-    alias_method :to_sass, :to_s
+
+    def to_sass(opts = {})
+      'null'
+    end
 
     # Returns a string representing a null value.
     #
@@ -9195,7 +9469,8 @@ module Sass::Script
       return "()" if value.empty?
       precedence = Sass::Script::Parser.precedence_of(separator)
       value.reject {|e| e.is_a?(Null)}.map do |v|
-        if v.is_a?(List) && Sass::Script::Parser.precedence_of(v.separator) <= precedence
+        if v.is_a?(List) && Sass::Script::Parser.precedence_of(v.separator) <= precedence ||
+            separator == :space && v.is_a?(UnaryOperation) && (v.operator == :minus || v.operator == :plus)
           "(#{v.to_sass(opts)})"
         else
           v.to_sass(opts)
@@ -9356,24 +9631,6 @@ MSG
     #   false otherwise
     def unary_not
       Sass::Script::Bool.new(!to_bool)
-    end
-
-    # The SassScript default operation (e.g. `$a $b`, `"foo" "bar"`).
-    #
-    # @param other [Literal] The right-hand side of the operator
-    # @return [Script::String] A string containing both literals
-    #   separated by a space
-    def space(other)
-      Sass::Script::String.new("#{self.to_s} #{other.to_s}")
-    end
-
-    # The SassScript `,` operation (e.g. `$a, $b`, `"foo", "bar"`).
-    #
-    # @param other [Literal] The right-hand side of the operator
-    # @return [Script::String] A string containing both literals
-    #   separated by `", "`
-    def comma(other)
-      Sass::Script::String.new("#{self.to_s},#{' ' unless options[:style] == :compressed}#{other.to_s}")
     end
 
     # The SassScript `=` operation
@@ -9539,7 +9796,7 @@ module Sass::Script
     # @see Node#to_s
     def to_s(opts = {})
       if @type == :identifier
-        return @value.tr("\n", " ")
+        return @value.gsub(/\n\s*/, " ")
       end
 
       return "\"#{value.gsub('"', "\\\"")}\"" if opts[:quote] == %q{"}
@@ -9561,9 +9818,14 @@ module Sass::Script
   #
   # Currently only `-`, `/`, and `not` are unary operators.
   class UnaryOperation < Node
-    # @param operand [Script::Node] The parse-tree node
-    #   for the object of the operator
-    # @param operator [Symbol] The operator to perform
+    # @return [Symbol] The operation to perform
+    attr_reader :operator
+
+    # @return [Script::Node] The parse-tree node for the object of the operator
+    attr_reader :operand
+
+    # @param operand [Script::Node] See \{#operand}
+    # @param operator [Symbol] See \{#operator}
     def initialize(operand, operator)
       @operand = operand
       @operator = operator
@@ -9830,7 +10092,6 @@ module Sass::Script
 
     # @see Node#to_sass
     def to_sass(opts = {})
-      pred = Sass::Script::Parser.precedence_of(@operator)
       o1 = operand_to_sass @operand1, :left, opts
       o2 = operand_to_sass @operand2, :right, opts
       sep =
@@ -10030,11 +10291,9 @@ module Sass
       STRING1_NOINTERP = /\"((?:[^\n\r\f\\"#]|#(?!\{)|\\#{NL}|#{ESCAPE})*)\"/
       STRING2_NOINTERP = /\'((?:[^\n\r\f\\'#]|#(?!\{)|\\#{NL}|#{ESCAPE})*)\'/
       STRING_NOINTERP = /#{STRING1_NOINTERP}|#{STRING2_NOINTERP}/
-      # Can't use IDENT here, because it seems to take exponential time on 1.8.
-      # We could use it for 1.9 only, but I don't want to introduce a cross-version
-      # behavior difference.
-      # In any case, almost all CSS idents will be matched by this.
-      STATIC_VALUE = /(-?#{NMSTART}|#{STRING_NOINTERP}|#[a-f0-9]|[,%]|-?#{NUMBER}|\!important)+([;}])/i
+
+      STATIC_COMPONENT = /#{IDENT}|#{STRING_NOINTERP}|#{HEXCOLOR}|[+-]?#{NUMBER}|\!important/i
+      STATIC_VALUE = /#{STATIC_COMPONENT}(\s*[\s,\/]\s*#{STATIC_COMPONENT})*([;}])/i
       STATIC_SELECTOR = /(#{NMCHAR}|[ \t]|[,>+*]|[:#.]#{NMSTART}){0,50}([{])/i
     end
   end
@@ -10285,8 +10544,6 @@ module Sass
       end
 
       def _variable(rx)
-        line = @line
-        offset = @offset
         return unless scan(rx)
 
         [:const, @scanner[2]]
@@ -10631,18 +10888,17 @@ RUBY
       def lexer_class; Lexer; end
 
       def expr
-        interp = try_ops_after_interp([:comma], :expr) and return interp
         line = @lexer.line
         return unless e = interpolation
-        arr = [e]
+        list = node(List.new([e], :comma), line)
         while tok = try_tok(:comma)
-          if interp = try_op_before_interp(tok, e)
+          if interp = try_op_before_interp(tok, list)
             return interp unless other_interp = try_ops_after_interp([:comma], :expr, interp)
             return other_interp
           end
-          arr << assert_expr(:interpolation)
+          list.value << assert_expr(:interpolation)
         end
-        arr.size == 1 ? arr.first : node(List.new(arr, :comma), line)
+        list.value.size == 1 ? list.value.first : list
       end
 
       production :equals, :interpolation, :single_eq
@@ -10735,8 +10991,6 @@ RUBY
         splat = nil
         must_have_default = false
         loop do
-          line = @lexer.line
-          offset = @lexer.offset + 1
           c = assert_tok(:const)
           var = Script::Variable.new(c.value)
           if try_tok(:colon)
@@ -10756,38 +11010,41 @@ RUBY
       end
 
       def fn_arglist
-        arglist(:fn_arglist, :equals)
+        arglist(:equals, "function argument")
       end
 
       def mixin_arglist
-        arglist(:mixin_arglist, :interpolation)
+        arglist(:interpolation, "mixin argument")
       end
 
-      def arglist(type, subexpr)
+      def arglist(subexpr, description)
         return unless e = send(subexpr)
-        if @lexer.peek && @lexer.peek.type == :colon
-          name = e
-          @lexer.expected!("comma") unless name.is_a?(Variable)
-          assert_tok(:colon)
-          keywords = {name.underscored_name => assert_expr(subexpr, EXPR_NAMES[type])}
-        end
 
-        unless try_tok(:comma)
-          return [], keywords if keywords
-          return [], {}, e if try_tok(:splat)
-          return [e], {}
-        end
+        args = []
+        keywords = {}
+        loop do
+          if @lexer.peek && @lexer.peek.type == :colon
+            name = e
+            @lexer.expected!("comma") unless name.is_a?(Variable)
+            assert_tok(:colon)
+            value = assert_expr(subexpr, description)
 
-        other_args, other_keywords, splat = assert_expr(type)
-        if keywords
-          if !other_args.empty? || splat
-            raise SyntaxError.new("Positional arguments must come before keyword arguments.")
-          elsif other_keywords[name.underscored_name]
-            raise SyntaxError.new("Keyword argument \"#{name.to_sass}\" passed more than once")
+            if keywords[name.underscored_name]
+              raise SyntaxError.new("Keyword argument \"#{name.to_sass}\" passed more than once")
+            end
+
+            keywords[name.underscored_name] = value
+          else
+            if !keywords.empty?
+              raise SyntaxError.new("Positional arguments must come before keyword arguments.")
+            end
+
+            return args, keywords, e if try_tok(:splat)
+            args << e
           end
-          return other_args, keywords.merge(other_keywords), splat
-        else
-          return [e, *other_args], other_keywords, splat
+
+          return args, keywords unless try_tok(:comma)
+          e = assert_expr(subexpr, description)
         end
       end
 
@@ -11008,6 +11265,18 @@ module Sass
         ql
       end
 
+      # Parses a supports query condition.
+      #
+      # @return [Sass::Supports::Condition] The parsed condition
+      # @raise [Sass::SyntaxError] if there's a syntax error in the condition,
+      #   or if it doesn't take up the entire input string.
+      def parse_supports_condition
+        init_scanner!
+        condition = supports_condition
+        expected("supports condition") unless @scanner.eos?
+        condition
+      end
+
       private
 
       include Sass::SCSS::RX
@@ -11064,7 +11333,6 @@ module Sass
           value = [text.sub(/^\s*\/\//, '/*').gsub(/^\s*\/\//, ' *') + ' */']
         else
           value = Sass::Engine.parse_interp(text, line, @scanner.pos - text.size, :filename => @filename)
-          value[0].slice!(2) if loud # get rid of the "!"
           value.unshift(@scanner.
             string[0...@scanner.pos].
             reverse[/.*?\*\/(.*?)($|\Z)/, 1].
@@ -11942,7 +12210,7 @@ MESSAGE
         line = @line
         @strs.push ""
         throw_error {yield} && @strs.last
-      rescue Sass::SyntaxError => e
+      rescue Sass::SyntaxError
         @scanner.pos = pos
         @line = line
         nil
@@ -11990,6 +12258,7 @@ MESSAGE
         :qualified_name => "identifier",
         :expr => "expression (e.g. 1px, bold)",
         :_selector => "selector",
+        :selector_comma_sequence => "selector",
         :simple_selector_sequence => "selector",
         :import_arg => "file to import (string or url())",
         :moz_document_function => "matching function (e.g. url-prefix(), domain())",
@@ -12056,7 +12325,7 @@ MESSAGE
       end
 
       def rethrow(err)
-        if @throw_err
+        if @throw_error
           throw :_sass_parser_error, err
         else
           @scanner = Sass::Util::MultibyteStringScanner.new(@scanner.string)
@@ -12449,9 +12718,9 @@ module Sass
 
         <<END
 /*
-#{header}
+#{header.gsub("*/", "*\\/")}
 
-Backtrace:\n#{e.backtrace.join("\n")}
+Backtrace:\n#{e.backtrace.join("\n").gsub("*/", "*\\/")}
 */
 body:before {
   white-space: pre;
@@ -12672,7 +12941,7 @@ module Sass
 
       # @see Base#mtime
       def mtime(name, options)
-        file, s = Sass::Util.destructure(find_real_file(@root, name, options))
+        file, _ = Sass::Util.destructure(find_real_file(@root, name, options))
         File.mtime(file) if file
       rescue Errno::ENOENT
         nil
@@ -13048,10 +13317,7 @@ module Sass::Media
         type = t1
         mod = m1.empty? ? m2 : m1
       end
-      q = Query.new([], [], other.expressions + expressions)
-      q.type = [type]
-      q.modifier = [mod]
-      return q
+      return Query.new([mod], [type], other.expressions + expressions)
     end
 
     # Returns the CSS for the media query.
@@ -13600,7 +13866,7 @@ module Sass
     # @return [[Sass::Engine]] The dependency documents.
     def dependencies
       _dependencies(Set.new, engines = Set.new)
-      engines - [self]
+      Sass::Util.array_minus(engines, [self])
     end
 
     # Helper for \{#dependencies}.
@@ -13944,7 +14210,6 @@ WARNING
           value = [line.text]
         else
           value = self.class.parse_interp(line.text, line.index, line.offset, :filename => @filename)
-          value[0].slice!(2) if loud # get rid of the "!"
         end
         value = with_extracted_values(value) do |str|
           str = str.gsub(/^#{line.comment_tab_str}/m, '')[2..-1] # get rid of // or /*
@@ -14021,6 +14286,12 @@ WARNING
         parser = Sass::SCSS::Parser.new(value, @options[:filename], @line)
         Tree::MediaNode.new(parser.parse_media_query_list.to_a)
       else
+        unprefixed_directive = directive.gsub(/^-[a-z0-9]+-/i, '')
+        if unprefixed_directive == 'supports'
+          parser = Sass::SCSS::Parser.new(value, @options[:filename], @line)
+          return Tree::SupportsNode.new(directive, parser.parse_supports_condition)
+        end
+
         Tree::DirectiveNode.new(
           value.nil? ? ["@#{directive}"] : ["@#{directive} "] + parse_interp(value, offset))
       end
@@ -14226,1151 +14497,5 @@ WARNING
       end
       res << rest
     end
-  end
-end
-
-dir = File.dirname(__FILE__)
-$LOAD_PATH.unshift dir unless $LOAD_PATH.include?(dir)
-
-# This is necessary to set so that the Haml code that tries to load Sass
-# knows that Sass is indeed loading,
-# even if there's some crazy autoload stuff going on.
-SASS_BEGUN_TO_LOAD = true unless defined?(SASS_BEGUN_TO_LOAD)
-
-
-# The module that contains everything Sass-related:
-#
-# * {Sass::Engine} is the class used to render Sass/SCSS within Ruby code.
-# * {Sass::Plugin} is interfaces with web frameworks (Rails and Merb in particular).
-# * {Sass::SyntaxError} is raised when Sass encounters an error.
-# * {Sass::CSS} handles conversion of CSS to Sass.
-#
-# Also see the {file:SASS_REFERENCE.md full Sass reference}.
-module Sass
-  # The global load paths for Sass files. This is meant for plugins and
-  # libraries to register the paths to their Sass stylesheets to that they may
-  # be `@imported`. This load path is used by every instance of [Sass::Engine].
-  # They are lower-precedence than any load paths passed in via the
-  # {file:SASS_REFERENCE.md#load_paths-option `:load_paths` option}.
-  #
-  # If the `SASS_PATH` environment variable is set,
-  # the initial value of `load_paths` will be initialized based on that.
-  # The variable should be a colon-separated list of path names
-  # (semicolon-separated on Windows).
-  #
-  # Note that files on the global load path are never compiled to CSS
-  # themselves, even if they aren't partials. They exist only to be imported.
-  #
-  # @example
-  #   Sass.load_paths << File.dirname(__FILE__ + '/sass')
-  # @return [Array<String, Pathname, Sass::Importers::Base>]
-  def self.load_paths
-    @load_paths ||= ENV['SASS_PATH'] ?
-      ENV['SASS_PATH'].split(Sass::Util.windows? ? ';' : ':') : []
-  end
-
-  # Compile a Sass or SCSS string to CSS.
-  # Defaults to SCSS.
-  #
-  # @param contents [String] The contents of the Sass file.
-  # @param options [{Symbol => Object}] An options hash;
-  #   see {file:SASS_REFERENCE.md#sass_options the Sass options documentation}
-  # @raise [Sass::SyntaxError] if there's an error in the document
-  # @raise [Encoding::UndefinedConversionError] if the source encoding
-  #   cannot be converted to UTF-8
-  # @raise [ArgumentError] if the document uses an unknown encoding with `@charset`
-  def self.compile(contents, options = {})
-    options[:syntax] ||= :scss
-    Engine.new(contents, options).to_css
-  end
-
-  # Compile a file on disk to CSS.
-  #
-  # @param filename [String] The path to the Sass, SCSS, or CSS file on disk.
-  # @param options [{Symbol => Object}] An options hash;
-  #   see {file:SASS_REFERENCE.md#sass_options the Sass options documentation}
-  # @raise [Sass::SyntaxError] if there's an error in the document
-  # @raise [Encoding::UndefinedConversionError] if the source encoding
-  #   cannot be converted to UTF-8
-  # @raise [ArgumentError] if the document uses an unknown encoding with `@charset`
-  #
-  # @overload compile_file(filename, options = {})
-  #   Return the compiled CSS rather than writing it to a file.
-  #
-  #   @return [String] The compiled CSS.
-  #
-  # @overload compile_file(filename, css_filename, options = {})
-  #   Write the compiled CSS to a file.
-  #
-  #   @param css_filename [String] The location to which to write the compiled CSS.
-  def self.compile_file(filename, *args)
-    options = args.last.is_a?(Hash) ? args.pop : {}
-    css_filename = args.shift
-    result = Sass::Engine.for_file(filename, options).render
-    if css_filename
-      options[:css_filename] ||= css_filename
-      open(css_filename,"w") {|css_file| css_file.write(result)}
-      nil
-    else
-      result
-    end
-  end
-end
-
-
-# Rails 3.0.0.beta.2+, < 3.1
-#RG if defined?(ActiveSupport) && Sass::Util.has?(:public_method, ActiveSupport, :on_load) &&
-#RG     !Sass::Util.ap_geq?('3.1.0.beta')
-# We keep configuration in its own self-contained file
-# so that we can load it independently in Rails 3,
-# where the full plugin stuff is lazy-loaded.
-
-module Sass
-  module Plugin
-    module Configuration
-
-      # Returns the default options for a {Sass::Plugin::Compiler}.
-      #
-      # @return [{Symbol => Object}]
-      def default_options
-        @default_options ||= {
-          :css_location       => './public/stylesheets',
-          :always_update      => false,
-          :always_check       => true,
-          :full_exception     => true,
-          :cache_location     => ".sass-cache"
-        }.freeze
-      end
-
-      # Resets the options and {Sass::Callbacks::InstanceMethods#clear_callbacks! clears all callbacks}.
-      def reset!
-        @options = nil
-        clear_callbacks!
-      end
-
-      # An options hash.
-      # See {file:SASS_REFERENCE.md#sass_options the Sass options documentation}.
-      #
-      # @return [{Symbol => Object}]
-      def options
-        @options ||= default_options.dup
-      end
-
-      # Sets the options hash.
-      # See {file:SASS_REFERENCE.md#sass_options the Sass options documentation}.
-      # See {Sass::Plugin::Configuration#reset!}
-      # @deprecated Instead, modify the options hash in-place.
-      # @param value [{Symbol => Object}] The options hash
-      def options=(value)
-        Sass::Util.sass_warn("Setting Sass::Plugin.options is deprecated " +
-                             "and will be removed in a future release.")
-        options.merge!(value)
-      end
-
-      # Adds a new template-location/css-location mapping.
-      # This means that Sass/SCSS files in `template_location`
-      # will be compiled to CSS files in `css_location`.
-      #
-      # This is preferred over manually manipulating the {file:SASS_REFERENCE.md#template_location-option `:template_location` option}
-      # since the option can be in multiple formats.
-      #
-      # Note that this method will change `options[:template_location]`
-      # to be in the Array format.
-      # This means that even if `options[:template_location]`
-      # had previously been a Hash or a String,
-      # it will now be an Array.
-      #
-      # @param template_location [String] The location where Sass/SCSS files will be.
-      # @param css_location [String] The location where compiled CSS files will go.
-      def add_template_location(template_location, css_location = options[:css_location])
-        normalize_template_location!
-        template_location_array << [template_location, css_location]
-      end
-
-      # Removes a template-location/css-location mapping.
-      # This means that Sass/SCSS files in `template_location`
-      # will no longer be compiled to CSS files in `css_location`.
-      #
-      # This is preferred over manually manipulating the {file:SASS_REFERENCE.md#template_location-option `:template_location` option}
-      # since the option can be in multiple formats.
-      #
-      # Note that this method will change `options[:template_location]`
-      # to be in the Array format.
-      # This means that even if `options[:template_location]`
-      # had previously been a Hash or a String,
-      # it will now be an Array.
-      #
-      # @param template_location [String]
-      #   The location where Sass/SCSS files were,
-      #   which is now going to be ignored.
-      # @param css_location [String]
-      #   The location where compiled CSS files went, but will no longer go.
-      # @return [Boolean]
-      #   Non-`nil` if the given mapping already existed and was removed,
-      #   or `nil` if nothing was changed.
-      def remove_template_location(template_location, css_location = options[:css_location])
-        normalize_template_location!
-        template_location_array.delete([template_location, css_location])
-      end
-
-      # Returns the template locations configured for Sass
-      # as an array of `[template_location, css_location]` pairs.
-      # See the {file:SASS_REFERENCE.md#template_location-option `:template_location` option}
-      # for details.
-      #
-      # @return [Array<(String, String)>]
-      #   An array of `[template_location, css_location]` pairs.
-      def template_location_array
-        old_template_location = options[:template_location]
-        normalize_template_location!
-        options[:template_location]
-      ensure
-        options[:template_location] = old_template_location
-      end
-
-      private
-
-      def normalize_template_location!
-        return if options[:template_location].is_a?(Array)
-        options[:template_location] =
-          case options[:template_location]
-          when nil
-            options[:css_location] ?
-              [[File.join(options[:css_location], 'sass'), options[:css_location]]] : []
-          when String; [[options[:template_location], options[:css_location]]]
-          else; options[:template_location].to_a
-          end
-      end
-    end
-  end
-end
-#RG   ActiveSupport.on_load(:before_configuration) do
-#RG   end
-#RG end
-
-# XXX CE: is this still necessary now that we have the compiler class?
-module Sass
-  # A lightweight infrastructure for defining and running callbacks.
-  # Callbacks are defined using \{#define\_callback\} at the class level,
-  # and called using `run_#{name}` at the instance level.
-  #
-  # Clients can add callbacks by calling the generated `on_#{name}` method,
-  # and passing in a block that's run when the callback is activated.
-  #
-  # @example Define a callback
-  #   class Munger
-  #     extend Sass::Callbacks
-  #     define_callback :string_munged
-  #
-  #     def munge(str)
-  #       res = str.gsub(/[a-z]/, '\1\1')
-  #       run_string_munged str, res
-  #       res
-  #     end
-  #   end
-  #
-  # @example Use a callback
-  #   m = Munger.new
-  #   m.on_string_munged {|str, res| puts "#{str} was munged into #{res}!"}
-  #   m.munge "bar" #=> bar was munged into bbaarr!
-  module Callbacks
-    # Automatically includes {InstanceMethods}
-    # when something extends this module.
-    #
-    # @param base [Module]
-    def self.extended(base)
-      base.send(:include, InstanceMethods)
-    end
-    protected
-
-    module InstanceMethods
-      # Removes all callbacks registered against this object.
-      def clear_callbacks!
-        @_sass_callbacks = {}
-      end
-    end
-
-    # Define a callback with the given name.
-    # This will define an `on_#{name}` method
-    # that registers a block,
-    # and a `run_#{name}` method that runs that block
-    # (optionall with some arguments).
-    #
-    # @param name [Symbol] The name of the callback
-    # @return [void]
-    def define_callback(name)
-      class_eval <<RUBY, __FILE__, __LINE__ + 1
-def on_#{name}(&block)
-  @_sass_callbacks ||= {}
-  (@_sass_callbacks[#{name.inspect}] ||= []) << block
-end
-
-def run_#{name}(*args)
-  return unless @_sass_callbacks
-  return unless @_sass_callbacks[#{name.inspect}]
-  @_sass_callbacks[#{name.inspect}].each {|c| c[*args]}
-end
-private :run_#{name}
-RUBY
-    end
-  end
-end
-module Sass
-  module Plugin
-    # The class handles `.s[ca]ss` file staleness checks via their mtime timestamps.
-    #
-    # To speed things up two level of caches are employed:
-    #
-    # * A class-level dependency cache which stores @import paths for each file.
-    #   This is a long-lived cache that is reused by every StalenessChecker instance.
-    # * Three short-lived instance-level caches, one for file mtimes,
-    #   one for whether a file is stale during this particular run.
-    #   and one for the parse tree for a file.
-    #   These are only used by a single StalenessChecker instance.
-    #
-    # Usage:
-    #
-    # * For a one-off staleness check of a single `.s[ca]ss` file,
-    #   the class-level {stylesheet_needs_update?} method
-    #   should be used.
-    # * For a series of staleness checks (e.g. checking all files for staleness)
-    #   a StalenessChecker instance should be created,
-    #   and the instance-level \{#stylesheet\_needs\_update?} method should be used.
-    #   the caches should make the whole process significantly faster.
-    #   *WARNING*: It is important not to retain the instance for too long,
-    #   as its instance-level caches are never explicitly expired.
-    class StalenessChecker
-      @dependencies_cache = {}
-
-      class << self
-        # TODO: attach this to a compiler instance.
-        # @private
-        attr_accessor :dependencies_cache
-      end
-
-      # Creates a new StalenessChecker
-      # for checking the staleness of several stylesheets at once.
-      #
-      # @param options [{Symbol => Object}]
-      #   See {file:SASS_REFERENCE.md#sass_options the Sass options documentation}.
-      def initialize(options)
-        @dependencies = self.class.dependencies_cache
-
-        # URIs that are being actively checked for staleness. Protects against
-        # import loops.
-        @actively_checking = Set.new
-
-        # Entries in the following instance-level caches are never explicitly expired.
-        # Instead they are supposed to automaticaly go out of scope when a series of staleness checks
-        # (this instance of StalenessChecker was created for) is finished.
-        @mtimes, @dependencies_stale, @parse_trees = {}, {}, {}
-        @options = Sass::Engine.normalize_options(options)
-      end
-
-      # Returns whether or not a given CSS file is out of date
-      # and needs to be regenerated.
-      #
-      # @param css_file [String] The location of the CSS file to check.
-      # @param template_file [String] The location of the Sass or SCSS template
-      #   that is compiled to `css_file`.
-      # @return [Boolean] Whether the stylesheet needs to be updated.
-      def stylesheet_needs_update?(css_file, template_file, importer = nil)
-        template_file = File.expand_path(template_file)
-        begin
-          css_mtime = File.mtime(css_file)
-        rescue Errno::ENOENT
-          return true
-        end
-        stylesheet_modified_since?(template_file, css_mtime, importer)
-      end
-
-      # Returns whether a Sass or SCSS stylesheet has been modified since a given time.
-      #
-      # @param template_file [String] The location of the Sass or SCSS template.
-      # @param mtime [Fixnum] The modification time to check against.
-      # @param importer [Sass::Importers::Base] The importer used to locate the stylesheet.
-      #   Defaults to the filesystem importer.
-      # @return [Boolean] Whether the stylesheet has been modified.
-      def stylesheet_modified_since?(template_file, mtime, importer = nil)
-        importer ||= @options[:filesystem_importer].new(".")
-        dependency_updated?(mtime).call(template_file, importer)
-      end
-
-      # Returns whether or not a given CSS file is out of date
-      # and needs to be regenerated.
-      #
-      # The distinction between this method and the instance-level \{#stylesheet\_needs\_update?}
-      # is that the instance method preserves mtime and stale-dependency caches,
-      # so it's better to use when checking multiple stylesheets at once.
-      #
-      # @param css_file [String] The location of the CSS file to check.
-      # @param template_file [String] The location of the Sass or SCSS template
-      #   that is compiled to `css_file`.
-      # @return [Boolean] Whether the stylesheet needs to be updated.
-      def self.stylesheet_needs_update?(css_file, template_file, importer = nil)
-        new(Plugin.engine_options).stylesheet_needs_update?(css_file, template_file, importer)
-      end
-
-      # Returns whether a Sass or SCSS stylesheet has been modified since a given time.
-      #
-      # The distinction between this method and the instance-level \{#stylesheet\_modified\_since?}
-      # is that the instance method preserves mtime and stale-dependency caches,
-      # so it's better to use when checking multiple stylesheets at once.
-      #
-      # @param template_file [String] The location of the Sass or SCSS template.
-      # @param mtime [Fixnum] The modification time to check against.
-      # @param importer [Sass::Importers::Base] The importer used to locate the stylesheet.
-      #   Defaults to the filesystem importer.
-      # @return [Boolean] Whether the stylesheet has been modified.
-      def self.stylesheet_modified_since?(template_file, mtime, importer = nil)
-        new(Plugin.engine_options).stylesheet_modified_since?(template_file, mtime, importer)
-      end
-
-      private
-
-      def dependencies_stale?(uri, importer, css_mtime)
-        timestamps = @dependencies_stale[[uri, importer]] ||= {}
-        timestamps.each_pair do |checked_css_mtime, is_stale|
-          if checked_css_mtime <= css_mtime && !is_stale
-            return false
-          elsif checked_css_mtime > css_mtime && is_stale
-            return true
-          end
-        end
-        timestamps[css_mtime] = dependencies(uri, importer).any?(&dependency_updated?(css_mtime))
-      rescue Sass::SyntaxError
-        # If there's an error finding dependencies, default to recompiling.
-        true
-      end
-
-      def mtime(uri, importer)
-        @mtimes[[uri, importer]] ||=
-          begin
-            mtime = importer.mtime(uri, @options)
-            if mtime.nil?
-              @dependencies.delete([uri, importer])
-              nil
-            else
-              mtime
-            end
-          end
-      end
-
-      def dependencies(uri, importer)
-        stored_mtime, dependencies = Sass::Util.destructure(@dependencies[[uri, importer]])
-
-        if !stored_mtime || stored_mtime < mtime(uri, importer)
-          dependencies = compute_dependencies(uri, importer)
-          @dependencies[[uri, importer]] = [mtime(uri, importer), dependencies]
-        end
-
-        dependencies
-      end
-
-      def dependency_updated?(css_mtime)
-        Proc.new do |uri, importer|
-          next true if @actively_checking.include?(uri)
-          begin
-            @actively_checking << uri
-            sass_mtime = mtime(uri, importer)
-            !sass_mtime ||
-              sass_mtime > css_mtime ||
-              dependencies_stale?(uri, importer, css_mtime)
-          ensure
-            @actively_checking.delete uri
-          end
-        end
-      end
-
-      def compute_dependencies(uri, importer)
-        tree(uri, importer).grep(Tree::ImportNode) do |n|
-          next if n.css_import?
-          file = n.imported_file
-          key = [file.options[:filename], file.options[:importer]]
-          @parse_trees[key] = file.to_tree
-          key
-        end.compact
-      end
-
-      def tree(uri, importer)
-        @parse_trees[[uri, importer]] ||= importer.find(uri, @options).to_tree
-      end
-    end
-  end
-end
-
-module Sass::Plugin
-
-  # The Compiler class handles compilation of multiple files and/or directories,
-  # including checking which CSS files are out-of-date and need to be updated
-  # and calling Sass to perform the compilation on those files.
-  #
-  # {Sass::Plugin} uses this class to update stylesheets for a single application.
-  # Unlike {Sass::Plugin}, though, the Compiler class has no global state,
-  # and so multiple instances may be created and used independently.
-  #
-  # If you need to compile a Sass string into CSS,
-  # please see the {Sass::Engine} class.
-  #
-  # Unlike {Sass::Plugin}, this class doesn't keep track of
-  # whether or how many times a stylesheet should be updated.
-  # Therefore, the following `Sass::Plugin` options are ignored by the Compiler:
-  #
-  # * `:never_update`
-  # * `:always_check`
-  class Compiler
-    include Sass::Util
-    include Configuration
-    extend Sass::Callbacks
-
-    # Creates a new compiler.
-    #
-    # @param options [{Symbol => Object}]
-    #   See {file:SASS_REFERENCE.md#sass_options the Sass options documentation}.
-    def initialize(options = {})
-      self.options.merge!(options)
-    end
-
-    # Register a callback to be run after stylesheets are mass-updated.
-    # This is run whenever \{#update\_stylesheets} is called,
-    # unless the \{file:SASS_REFERENCE.md#never_update-option `:never_update` option}
-    # is enabled.
-    #
-    # @yield [individual_files]
-    # @yieldparam individual_files [<(String, String)>]
-    #   Individual files to be updated, in addition to the directories
-    #   specified in the options.
-    #   The first element of each pair is the source file,
-    #   the second is the target CSS file.
-    define_callback :updating_stylesheets
-
-    # Register a callback to be run after a single stylesheet is updated.
-    # The callback is only run if the stylesheet is really updated;
-    # if the CSS file is fresh, this won't be run.
-    #
-    # Even if the \{file:SASS_REFERENCE.md#full_exception-option `:full_exception` option}
-    # is enabled, this callback won't be run
-    # when an exception CSS file is being written.
-    # To run an action for those files, use \{#on\_compilation\_error}.
-    #
-    # @yield [template, css]
-    # @yieldparam template [String]
-    #   The location of the Sass/SCSS file being updated.
-    # @yieldparam css [String]
-    #   The location of the CSS file being generated.
-    define_callback :updated_stylesheet
-
-    # Register a callback to be run before a single stylesheet is updated.
-    # The callback is only run if the stylesheet is guaranteed to be updated;
-    # if the CSS file is fresh, this won't be run.
-    #
-    # Even if the \{file:SASS_REFERENCE.md#full_exception-option `:full_exception` option}
-    # is enabled, this callback won't be run
-    # when an exception CSS file is being written.
-    # To run an action for those files, use \{#on\_compilation\_error}.
-    #
-    # @yield [template, css]
-    # @yieldparam template [String]
-    #   The location of the Sass/SCSS file being updated.
-    # @yieldparam css [String]
-    #   The location of the CSS file being generated.
-    define_callback :updating_stylesheet
-
-    def on_updating_stylesheet_with_deprecation_warning(&block)
-      Sass::Util.sass_warn("Sass::Compiler#on_updating_stylesheet callback is deprecated and will be removed in a future release. Use Sass::Compiler#on_updated_stylesheet instead, which is run after stylesheet compilation.")
-      on_updating_stylesheet_without_deprecation_warning(&block)
-    end
-    alias_method :on_updating_stylesheet_without_deprecation_warning, :on_updating_stylesheet
-    alias_method :on_updating_stylesheet, :on_updating_stylesheet_with_deprecation_warning
-
-    # Register a callback to be run when Sass decides not to update a stylesheet.
-    # In particular, the callback is run when Sass finds that
-    # the template file and none of its dependencies
-    # have been modified since the last compilation.
-    #
-    # Note that this is **not** run when the
-    # \{file:SASS_REFERENCE.md#never-update_option `:never_update` option} is set,
-    # nor when Sass decides not to compile a partial.
-    #
-    # @yield [template, css]
-    # @yieldparam template [String]
-    #   The location of the Sass/SCSS file not being updated.
-    # @yieldparam css [String]
-    #   The location of the CSS file not being generated.
-    define_callback :not_updating_stylesheet
-
-    # Register a callback to be run when there's an error
-    # compiling a Sass file.
-    # This could include not only errors in the Sass document,
-    # but also errors accessing the file at all.
-    #
-    # @yield [error, template, css]
-    # @yieldparam error [Exception] The exception that was raised.
-    # @yieldparam template [String]
-    #   The location of the Sass/SCSS file being updated.
-    # @yieldparam css [String]
-    #   The location of the CSS file being generated.
-    define_callback :compilation_error
-
-    # Register a callback to be run when Sass creates a directory
-    # into which to put CSS files.
-    #
-    # Note that even if multiple levels of directories need to be created,
-    # the callback may only be run once.
-    # For example, if "foo/" exists and "foo/bar/baz/" needs to be created,
-    # this may only be run for "foo/bar/baz/".
-    # This is not a guarantee, however;
-    # it may also be run for "foo/bar/".
-    #
-    # @yield [dirname]
-    # @yieldparam dirname [String]
-    #   The location of the directory that was created.
-    define_callback :creating_directory
-
-    # Register a callback to be run when Sass detects
-    # that a template has been modified.
-    # This is only run when using \{#watch}.
-    #
-    # @yield [template]
-    # @yieldparam template [String]
-    #   The location of the template that was modified.
-    define_callback :template_modified
-
-    # Register a callback to be run when Sass detects
-    # that a new template has been created.
-    # This is only run when using \{#watch}.
-    #
-    # @yield [template]
-    # @yieldparam template [String]
-    #   The location of the template that was created.
-    define_callback :template_created
-
-    # Register a callback to be run when Sass detects
-    # that a template has been deleted.
-    # This is only run when using \{#watch}.
-    #
-    # @yield [template]
-    # @yieldparam template [String]
-    #   The location of the template that was deleted.
-    define_callback :template_deleted
-
-    # Register a callback to be run when Sass deletes a CSS file.
-    # This happens when the corresponding Sass/SCSS file has been deleted.
-    #
-    # @yield [filename]
-    # @yieldparam filename [String]
-    #   The location of the CSS file that was deleted.
-    define_callback :deleting_css
-
-    # Updates out-of-date stylesheets.
-    #
-    # Checks each Sass/SCSS file in {file:SASS_REFERENCE.md#template_location-option `:template_location`}
-    # to see if it's been modified more recently than the corresponding CSS file
-    # in {file:SASS_REFERENCE.md#css_location-option `:css_location`}.
-    # If it has, it updates the CSS file.
-    #
-    # @param individual_files [Array<(String, String)>]
-    #   A list of files to check for updates
-    #   **in addition to those specified by the
-    #   {file:SASS_REFERENCE.md#template_location-option `:template_location` option}.**
-    #   The first string in each pair is the location of the Sass/SCSS file,
-    #   the second is the location of the CSS file that it should be compiled to.
-    def update_stylesheets(individual_files = [])
-      individual_files = individual_files.dup
-      Sass::Plugin.checked_for_updates = true
-      staleness_checker = StalenessChecker.new(engine_options)
-
-      template_location_array.each do |template_location, css_location|
-        Sass::Util.glob(File.join(template_location, "**", "[^_]*.s[ca]ss")).sort.each do |file|
-          # Get the relative path to the file
-          name = file.sub(template_location.to_s.sub(/\/*$/, '/'), "")
-          css = css_filename(name, css_location)
-          individual_files << [file, css]
-        end
-      end
-
-      run_updating_stylesheets individual_files
-
-      individual_files.each do |file, css|
-        if options[:always_update] || staleness_checker.stylesheet_needs_update?(css, file)
-          update_stylesheet(file, css)
-        else
-          run_not_updating_stylesheet(file, css)
-        end
-      end
-    end
-
-    # Watches the template directory (or directories)
-    # and updates the CSS files whenever the related Sass/SCSS files change.
-    # `watch` never returns.
-    #
-    # Whenever a change is detected to a Sass/SCSS file in
-    # {file:SASS_REFERENCE.md#template_location-option `:template_location`},
-    # the corresponding CSS file in {file:SASS_REFERENCE.md#css_location-option `:css_location`}
-    # will be recompiled.
-    # The CSS files of any Sass/SCSS files that import the changed file will also be recompiled.
-    #
-    # Before the watching starts in earnest, `watch` calls \{#update\_stylesheets}.
-    #
-    # Note that `watch` uses the [Listen](http://github.com/guard/listen) library
-    # to monitor the filesystem for changes.
-    # Listen isn't loaded until `watch` is run.
-    # The version of Listen distributed with Sass is loaded by default,
-    # but if another version has already been loaded that will be used instead.
-    #
-    # @param individual_files [Array<(String, String)>]
-    #   A list of files to watch for updates
-    #   **in addition to those specified by the
-    #   {file:SASS_REFERENCE.md#template_location-option `:template_location` option}.**
-    #   The first string in each pair is the location of the Sass/SCSS file,
-    #   the second is the location of the CSS file that it should be compiled to.
-    def watch(individual_files = [])
-      update_stylesheets(individual_files)
-
-      begin
-        require 'listen'
-      rescue LoadError => e
-        dir = Sass::Util.scope("vendor/listen/lib")
-        if $LOAD_PATH.include?(dir)
-          e.message << "\n" <<
-            if File.exists?(scope(".git"))
-              'Run "git submodule update --init" to get the recommended version.'
-            else
-              'Run "gem install listen" to get it.'
-            end
-          raise e
-        else
-          $LOAD_PATH.unshift dir
-          retry
-        end
-      end
-
-      template_paths = template_locations # cache the locations
-      individual_files_hash = individual_files.inject({}) do |h, files|
-        parent = File.dirname(files.first)
-        (h[parent] ||= []) << files unless template_paths.include?(parent)
-        h
-      end
-      directories = template_paths + individual_files_hash.keys +
-        [{:relative_paths => true}]
-
-      # TODO: Keep better track of what depends on what
-      # so we don't have to run a global update every time anything changes.
-      listener = Listen::MultiListener.new(*directories) do |modified, added, removed|
-        modified.each do |f|
-          parent = File.dirname(f)
-          if files = individual_files_hash[parent]
-            next unless files.first == f
-          else
-            next unless f =~ /\.s[ac]ss$/
-          end
-          run_template_modified(f)
-        end
-
-        added.each do |f|
-          parent = File.dirname(f)
-          if files = individual_files_hash[parent]
-            next unless files.first == f
-          else
-            next unless f =~ /\.s[ac]ss$/
-          end
-          run_template_created(f)
-        end
-
-        removed.each do |f|
-          parent = File.dirname(f)
-          if files = individual_files_hash[parent]
-            next unless files.first == f
-            try_delete_css files[1]
-          else
-            next unless f =~ /\.s[ac]ss$/
-            try_delete_css f.gsub(/\.s[ac]ss$/, '.css')
-          end
-          run_template_deleted(f)
-        end
-
-        update_stylesheets(individual_files)
-      end
-
-      # The native windows listener is much slower than the polling
-      # option, according to https://github.com/nex3/sass/commit/a3031856b22bc834a5417dedecb038b7be9b9e3e#commitcomment-1295118
-      listener.force_polling(true) if @options[:poll] || Sass::Util.windows?
-
-      begin
-        listener.start
-      rescue Exception => e
-        raise e unless e.is_a?(Interrupt)
-      end
-    end
-
-    # Non-destructively modifies \{#options} so that default values are properly set,
-    # and returns the result.
-    #
-    # @param additional_options [{Symbol => Object}] An options hash with which to merge \{#options}
-    # @return [{Symbol => Object}] The modified options hash
-    def engine_options(additional_options = {})
-      opts = options.merge(additional_options)
-      opts[:load_paths] = load_paths(opts)
-      opts
-    end
-
-    # Compass expects this to exist
-    def stylesheet_needs_update?(css_file, template_file)
-      StalenessChecker.stylesheet_needs_update?(css_file, template_file)
-    end
-
-    private
-
-    def update_stylesheet(filename, css)
-      dir = File.dirname(css)
-      unless File.exists?(dir)
-        run_creating_directory dir
-        FileUtils.mkdir_p dir
-      end
-
-      begin
-        File.read(filename) unless File.readable?(filename) # triggers an error for handling
-        engine_opts = engine_options(:css_filename => css, :filename => filename)
-        result = Sass::Engine.for_file(filename, engine_opts).render
-      rescue Exception => e
-        compilation_error_occured = true
-        run_compilation_error e, filename, css
-        result = Sass::SyntaxError.exception_to_css(e, options)
-      else
-        run_updating_stylesheet filename, css
-      end
-
-      write_file(css, result)
-      run_updated_stylesheet(filename, css) unless compilation_error_occured
-    end
-
-    def write_file(css, content)
-      flag = 'w'
-      flag = 'wb' if Sass::Util.windows? && options[:unix_newlines]
-      File.open(css, flag) do |file|
-        file.set_encoding(content.encoding) unless Sass::Util.ruby1_8?
-        file.print(content)
-      end
-    end
-
-    def try_delete_css(css)
-      return unless File.exists?(css)
-      run_deleting_css css
-      File.delete css
-    end
-
-    def load_paths(opts = options)
-      (opts[:load_paths] || []) + template_locations
-    end
-
-    def template_locations
-      template_location_array.to_a.map {|l| l.first}
-    end
-
-    def css_locations
-      template_location_array.to_a.map {|l| l.last}
-    end
-
-    def css_filename(name, path)
-      "#{path}/#{name}".gsub(/\.s[ac]ss$/, '.css')
-    end
-  end
-end
-
-module Sass
-  # This module provides a single interface to the compilation of Sass/SCSS files
-  # for an application. It provides global options and checks whether CSS files
-  # need to be updated.
-  #
-  # This module is used as the primary interface with Sass
-  # when it's used as a plugin for various frameworks.
-  # All Rack-enabled frameworks are supported out of the box.
-  # The plugin is {file:SASS_REFERENCE.md#rails_merb_plugin automatically activated for Rails and Merb}.
-  # Other frameworks must enable it explicitly; see {Sass::Plugin::Rack}.
-  #
-  # This module has a large set of callbacks available
-  # to allow users to run code (such as logging) when certain things happen.
-  # All callback methods are of the form `on_#{name}`,
-  # and they all take a block that's called when the given action occurs.
-  #
-  # Note that this class proxies almost all methods to its {Sass::Plugin::Compiler} instance.
-  # See \{#compiler}.
-  #
-  # @example Using a callback
-  #   Sass::Plugin.on_updating_stylesheet do |template, css|
-  #     puts "Compiling #{template} to #{css}"
-  #   end
-  #   Sass::Plugin.update_stylesheets
-  #     #=> Compiling app/sass/screen.scss to public/stylesheets/screen.css
-  #     #=> Compiling app/sass/print.scss to public/stylesheets/print.css
-  #     #=> Compiling app/sass/ie.scss to public/stylesheets/ie.css
-  # @see Sass::Plugin::Compiler
-  module Plugin
-    include Sass::Util
-    extend self
-
-    @checked_for_updates = false
-
-    # Whether or not Sass has **ever** checked if the stylesheets need to be updated
-    # (in this Ruby instance).
-    #
-    # @return [Boolean]
-    attr_accessor :checked_for_updates
-
-    # Same as \{#update\_stylesheets}, but respects \{#checked\_for\_updates}
-    # and the {file:SASS_REFERENCE.md#always_update-option `:always_update`}
-    # and {file:SASS_REFERENCE.md#always_check-option `:always_check`} options.
-    #
-    # @see #update_stylesheets
-    def check_for_updates
-      return unless !Sass::Plugin.checked_for_updates ||
-          Sass::Plugin.options[:always_update] || Sass::Plugin.options[:always_check]
-      update_stylesheets
-    end
-
-    # Returns the singleton compiler instance.
-    # This compiler has been pre-configured according
-    # to the plugin configuration.
-    #
-    # @return [Sass::Plugin::Compiler]
-    def compiler
-      @compiler ||= Compiler.new
-    end
-
-    # Updates out-of-date stylesheets.
-    #
-    # Checks each Sass/SCSS file in {file:SASS_REFERENCE.md#template_location-option `:template_location`}
-    # to see if it's been modified more recently than the corresponding CSS file
-    # in {file:SASS_REFERENCE.md#css_location-option `:css_location`}.
-    # If it has, it updates the CSS file.
-    #
-    # @param individual_files [Array<(String, String)>]
-    #   A list of files to check for updates
-    #   **in addition to those specified by the
-    #   {file:SASS_REFERENCE.md#template_location-option `:template_location` option}.**
-    #   The first string in each pair is the location of the Sass/SCSS file,
-    #   the second is the location of the CSS file that it should be compiled to.
-    def update_stylesheets(individual_files = [])
-      return if options[:never_update]
-      compiler.update_stylesheets(individual_files)
-    end
-
-    # Updates all stylesheets, even those that aren't out-of-date.
-    # Ignores the cache.
-    #
-    # @param individual_files [Array<(String, String)>]
-    #   A list of files to check for updates
-    #   **in addition to those specified by the
-    #   {file:SASS_REFERENCE.md#template_location-option `:template_location` option}.**
-    #   The first string in each pair is the location of the Sass/SCSS file,
-    #   the second is the location of the CSS file that it should be compiled to.
-    # @see #update_stylesheets
-    def force_update_stylesheets(individual_files = [])
-      Compiler.new(options.dup.merge(
-          :never_update => false,
-          :always_update => true,
-          :cache => false)).update_stylesheets(individual_files)
-    end
-
-    # All other method invocations are proxied to the \{#compiler}.
-    #
-    # @see #compiler
-    # @see Sass::Plugin::Compiler
-    def method_missing(method, *args, &block)
-      if compiler.respond_to?(method)
-        compiler.send(method, *args, &block)
-      else
-        super
-      end
-    end
-
-    # For parity with method_missing
-    def respond_to?(method)
-      super || compiler.respond_to?(method)
-    end
-
-    # There's a small speedup by not using method missing for frequently delegated methods.
-    def options
-      compiler.options
-    end
-
-  end
-end
-
-if defined?(ActionController)
-unless defined?(Sass::RAILS_LOADED)
-  Sass::RAILS_LOADED = true
-
-  module Sass::Plugin::Configuration
-    # Different default options in a rails envirionment.
-    def default_options
-      return @default_options if @default_options
-      opts = {
-        :quiet             => Sass::Util.rails_env != "production",
-        :full_exception    => Sass::Util.rails_env != "production",
-        :cache_location    => Sass::Util.rails_root + '/tmp/sass-cache'
-      }
-
-      opts.merge!(
-        :always_update     => false,
-        :template_location => Sass::Util.rails_root + '/public/stylesheets/sass',
-        :css_location      => Sass::Util.rails_root + '/public/stylesheets',
-        :always_check      => Sass::Util.rails_env == "development")
-
-      @default_options = opts.freeze
-    end
-  end
-
-  Sass::Plugin.options.reverse_merge!(Sass::Plugin.default_options)
-
-  # Rails 3.1 loads and handles Sass all on its own
-  if defined?(ActionController::Metal)
-    # 3.1 > Rails >= 3.0
-module Sass
-  module Plugin
-    # Rack middleware for compiling Sass code.
-    #
-    # ## Activate
-    #
-    #     use Sass::Plugin::Rack
-    #
-    # ## Customize
-    #
-    #     Sass::Plugin.options.merge(
-    #       :cache_location => './tmp/sass-cache',
-    #       :never_update => environment != :production,
-    #       :full_exception => environment != :production)
-    #
-    # {file:SASS_REFERENCE.md#options See the Reference for more options}.
-    #
-    # ## Use
-    #
-    # Put your Sass files in `public/stylesheets/sass`.
-    # Your CSS will be generated in `public/stylesheets`,
-    # and regenerated every request if necessary.
-    # The locations and frequency {file:SASS_REFERENCE.md#options can be customized}.
-    # That's all there is to it!
-    class Rack
-      # The delay, in seconds, between update checks.
-      # Useful when many resources are requested for a single page.
-      # `nil` means no delay at all.
-      #
-      # @return [Float]
-      attr_accessor :dwell
-
-      # Initialize the middleware.
-      #
-      # @param app [#call] The Rack application
-      # @param dwell [Float] See \{#dwell}
-      def initialize(app, dwell = 1.0)
-        @app = app
-        @dwell = dwell
-        @check_after = Time.now.to_f
-      end
-
-      # Process a request, checking the Sass stylesheets for changes
-      # and updating them if necessary.
-      #
-      # @param env The Rack request environment
-      # @return [(#to_i, {String => String}, Object)] The Rack response
-      def call(env)
-        if @dwell.nil? || Time.now.to_f > @check_after
-          Sass::Plugin.check_for_updates
-          @check_after = Time.now.to_f + @dwell if @dwell
-        end
-        @app.call(env)
-      end
-    end
-  end
-end
-
-    Rails.configuration.middleware.use(Sass::Plugin::Rack)
-  elsif defined?(ActionController::Dispatcher) &&
-      defined?(ActionController::Dispatcher.middleware)
-    # Rails >= 2.3
-    ActionController::Dispatcher.middleware.use(Sass::Plugin::Rack)
-  else
-    module ActionController
-      class Base
-        alias_method :sass_old_process, :process
-        def process(*args)
-          Sass::Plugin.check_for_updates
-          sass_old_process(*args)
-        end
-      end
-    end
-  end
-end
-elsif defined?(Merb::Plugins)
-unless defined?(Sass::MERB_LOADED)
-  Sass::MERB_LOADED = true
-
-  module Sass::Plugin::Configuration
-    # Different default options in a m envirionment.
-    def default_options
-      @default_options ||= begin
-        version = Merb::VERSION.split('.').map { |n| n.to_i }
-        if version[0] <= 0 && version[1] < 5
-          root = MERB_ROOT
-          env  = MERB_ENV
-        else
-          root = Merb.root.to_s
-          env  = Merb.environment
-        end
-
-        {
-          :always_update      => false,
-          :template_location => root + '/public/stylesheets/sass',
-          :css_location      => root + '/public/stylesheets',
-          :cache_location    => root + '/tmp/sass-cache',
-          :always_check      => env != "production",
-          :quiet             => env != "production",
-          :full_exception    => env != "production"
-        }.freeze
-      end
-    end
-  end
-
-  config = Merb::Plugins.config[:sass] || Merb::Plugins.config["sass"] || {}
-
-  if defined? config.symbolize_keys!
-    config.symbolize_keys!
-  end
-
-  Sass::Plugin.options.merge!(config)
-
-  class Sass::Plugin::MerbBootLoader < Merb::BootLoader
-    after Merb::BootLoader::RackUpApplication
-
-    def self.run
-      # Apparently there's no better way than this to add Sass
-      # to Merb's Rack stack.
-      Merb::Config[:app] = Sass::Plugin::Rack.new(Merb::Config[:app])
-    end
-  end
-end
-else
-# The reason some options are declared here rather than in sass/plugin/configuration.rb
-# is that otherwise they'd clobber the Rails-specific options.
-# Since Rails' options are lazy-loaded in Rails 3,
-# they're reverse-merged with the default options
-# so that user configuration is preserved.
-# This means that defaults that differ from Rails'
-# must be declared here.
-
-unless defined?(Sass::GENERIC_LOADED)
-  Sass::GENERIC_LOADED = true
-
-  Sass::Plugin.options.merge!(:css_location   => './public/stylesheets',
-                              :always_update  => false,
-                              :always_check   => true)
-end
-end
-
-# Rails 3.0.0.beta.2+, < 3.1
-if defined?(ActiveSupport) && Sass::Util.has?(:public_method, ActiveSupport, :on_load) &&
-    !Sass::Util.ap_geq?('3.1.0.beta')
-  ActiveSupport.on_load(:before_configuration) do
-    require 'sass'
   end
 end
